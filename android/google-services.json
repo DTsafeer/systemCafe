@@ -1,0 +1,46 @@
+{
+  "project_info": {
+    "project_number": "588869383950",
+    "project_id": "systemcafe-852b7",
+    "storage_bucket": "systemcafe-852b7.firebasestorage.app"
+  },
+  "client": [
+    {
+      "client_info": {
+        "mobilesdk_app_id": "1:588869383950:android:75c3014eb904b0b18bc95f",
+        "android_client_info": {
+          "package_name": "com.example.floracafe"
+        }
+      },
+      "oauth_client": [
+        {
+          "client_id": "588869383950-aj73o6frrmoe3ktsdrdd3rgkl4a5q7a2.apps.googleusercontent.com",
+          "client_type": 3
+        }
+      ],
+      "api_key": [
+        {
+          "current_key": "AIzaSyAOCaiqXki0K7fLbBikXT5VU0_MRC09pX0"
+        }
+      ],
+      "services": {
+        "appinvite_service": {
+          "other_platform_oauth_client": [
+            {
+              "client_id": "588869383950-aj73o6frrmoe3ktsdrdd3rgkl4a5q7a2.apps.googleusercontent.com",
+              "client_type": 3
+            },
+            {
+              "client_id": "588869383950-6omi7f4nu0lrsqeaud8escjqbr500uah.apps.googleusercontent.com",
+              "client_type": 2,
+              "ios_info": {
+                "bundle_id": "com.example.floracafe"
+              }
+            }
+          ]
+        }
+      }
+    }
+  ],
+  "configuration_version": "1"
+}
