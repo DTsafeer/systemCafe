@@ -1,11 +1,15 @@
+import 'dart:async';
 import 'package:flutter/material.dart';
 import 'package:cloud_firestore/cloud_firestore.dart';
+import '../utils/database_helper.dart';
+import '../widgets/app_components.dart';
+import '../widgets/inventory_dialogs.dart';
 import 'user_model.dart';
+import 'MainLayout.dart';
+import 'addproduct.dart';
 
-// ----------------- الصفحة الرئيسية للمخزن -----------------
 class InventoryPage extends StatefulWidget {
   final User currentUser;
-
   const InventoryPage({super.key, required this.currentUser});
 
   @override
@@ -14,112 +18,78 @@ class InventoryPage extends StatefulWidget {
 
 class _InventoryPageState extends State<InventoryPage> {
   final TextEditingController _searchController = TextEditingController();
-  String _searchQuery = "";
+  final ValueNotifier<String> _searchQueryNotifier = ValueNotifier<String>("");
+  Timer? _debounce;
+  final DatabaseHelper _dbHelper = DatabaseHelper();
+  late String managerId;
+
+  @override
+  void initState() {
+    super.initState();
+    managerId = widget.currentUser.parentId ?? widget.currentUser.id;
+  }
+
+  void _onSearchChanged(String query) {
+    if (_debounce?.isActive ?? false) _debounce?.cancel();
+    _debounce = Timer(const Duration(milliseconds: 300), () {
+      _searchQueryNotifier.value = query.trim().toLowerCase();
+    });
+  }
 
   @override
   void dispose() {
     _searchController.dispose();
+    _searchQueryNotifier.dispose();
+    _debounce?.cancel();
     super.dispose();
   }
 
   @override
   Widget build(BuildContext context) {
     final theme = Theme.of(context);
-    final bool canEditInventory = widget.currentUser.role == UserRole.admin || widget.currentUser.permissions['canEditMenu'] == true;
+    
+    if (!widget.currentUser.canRead('inventory')) {
+      return MainLayout(
+        currentUser: widget.currentUser,
+        currentPage: 'inventory',
+        child: const Scaffold(body: Center(child: Text("عذراً، لا تملك صلاحية لعرض صفحة المخزن"))),
+      );
+    }
 
-    return Scaffold(
-      backgroundColor: theme.scaffoldBackgroundColor,
-      appBar: AppBar(
-        title: const Text("إدارة المخزن 📦", style: TextStyle(fontWeight: FontWeight.bold)),
-        backgroundColor: theme.colorScheme.primary,
-        foregroundColor: theme.colorScheme.onPrimary,
-        centerTitle: true,
-      ),
-      body: Column(
+    return MainLayout(
+      currentUser: widget.currentUser,
+      currentPage: 'inventory',
+      floatingActionButton: widget.currentUser.canCreate('inventory') ? FloatingActionButton.extended(
+        onPressed: () => InventoryDialogs.showAddInventoryItem(context: context, currentUser: widget.currentUser),
+        backgroundColor: theme.primaryColor,
+        icon: const Icon(Icons.add_shopping_cart_rounded, color: Colors.white),
+        label: const Text("إضافة صنف مخزني", style: TextStyle(color: Colors.white, fontWeight: FontWeight.bold)),
+      ) : null,
+      child: Column(
         children: [
-          // --- حقل البحث ---
-          Padding(
-            padding: const EdgeInsets.all(16.0),
-            child: TextField(
-              controller: _searchController,
-              decoration: InputDecoration(
-                hintText: 'بحث في الأصناف...',
-                prefixIcon: Icon(Icons.search, color: theme.colorScheme.primary),
-                suffixIcon: _searchQuery.isNotEmpty
-                    ? IconButton(
-                  icon: const Icon(Icons.cancel, color: Colors.grey),
-                  onPressed: () {
-                    _searchController.clear();
-                    setState(() => _searchQuery = "");
-                  },
-                )
-                    : null,
-                filled: true,
-                fillColor: theme.cardColor,
-                border: OutlineInputBorder(
-                  borderRadius: BorderRadius.circular(15),
-                  borderSide: BorderSide.none,
+          Container(
+            padding: const EdgeInsets.all(20),
+            decoration: BoxDecoration(color: Colors.white, border: Border(bottom: BorderSide(color: Colors.grey[100]!))),
+            child: Row(
+              children: [
+                Text("مخزن المحل", style: theme.textTheme.headlineSmall?.copyWith(fontWeight: FontWeight.bold)),
+                const Spacer(),
+                SizedBox(
+                  width: 300,
+                  child: TextField(
+                    controller: _searchController,
+                    onChanged: _onSearchChanged,
+                    decoration: AppComponents.fieldInput("بحث عن صنف...", Icons.search).copyWith(contentPadding: const EdgeInsets.symmetric(vertical: 0)),
+                  ),
                 ),
-                contentPadding: const EdgeInsets.symmetric(vertical: 0),
-              ),
-              onChanged: (value) => setState(() => _searchQuery = value.trim().toLowerCase()),
+              ],
             ),
           ),
-
-          // --- قائمة المنتجات (تعمل أوفلاين تلقائياً عبر snapshots) ---
           Expanded(
-            child: StreamBuilder<QuerySnapshot>(
-              // فايبربيز سيعيد البيانات من الكاش إذا كان الجهاز أوفلاين
-              stream: FirebaseFirestore.instance
-                  .collection('inventory')
-                  .where('cafeId', isEqualTo: widget.currentUser.cafeId)
-                  .snapshots(),
-              builder: (context, snapshot) {
-                if (snapshot.connectionState == ConnectionState.waiting) {
-                  return const Center(child: CircularProgressIndicator());
-                }
-
-// التأكد من وجود بيانات قبل فحص الميتاداتا
-                bool isOffline = false;
-                if (snapshot.hasData && snapshot.data != null) {
-                  isOffline = snapshot.data!.metadata.isFromCache;
-                }
-                if (!snapshot.hasData || snapshot.data!.docs.isEmpty) {
-                  return const Center(child: Text("المخزن فارغ!"));
-                }
-
-                final filteredDocs = snapshot.data!.docs.where((doc) {
-                  final data = doc.data() as Map<String, dynamic>;
-                  final name = (data['name'] ?? '').toString().toLowerCase();
-                  return name.contains(_searchQuery);
-                }).toList();
-
-                filteredDocs.sort((a, b) => (a['name'] as String).compareTo(b['name'] as String));
-
-                return GridView.builder(
-                  padding: const EdgeInsets.fromLTRB(16, 0, 16, 80),
-                  gridDelegate: const SliverGridDelegateWithFixedCrossAxisCount(
-                    crossAxisCount: 2,
-                    childAspectRatio: 0.75,
-                    crossAxisSpacing: 12,
-                    mainAxisSpacing: 12,
-                  ),
-                  itemCount: filteredDocs.length,
-                  itemBuilder: (context, index) {
-                    var doc = filteredDocs[index];
-                    var data = doc.data() as Map<String, dynamic>;
-
-                    return InventoryCard(
-                      docRef: doc.reference,
-                      name: data['name'] ?? 'بدون اسم',
-                      imageUrl: data['image'] ?? '',
-                      quantity: (data['quantity'] ?? 0.0).toDouble(),
-                      theme: theme,
-                      canEdit: canEditInventory,
-                      currentUser: widget.currentUser,
-                    );
-                  },
-                );
+            child: ValueListenableBuilder<String>(
+              valueListenable: _searchQueryNotifier,
+              builder: (context, query, _) {
+                return _InventoryGrid(searchQuery: query, managerId: managerId, currentUser: widget.currentUser, dbHelper: _dbHelper);
               },
             ),
           ),
@@ -129,162 +99,106 @@ class _InventoryPageState extends State<InventoryPage> {
   }
 }
 
-// ----------------- بطاقة عرض المنتج -----------------
-class InventoryCard extends StatelessWidget {
-  final DocumentReference docRef;
-  final String name, imageUrl;
-  final double quantity;
-  final ThemeData theme;
-  final bool canEdit;
+class _InventoryGrid extends StatefulWidget {
+  final String searchQuery;
+  final String managerId;
   final User currentUser;
+  final DatabaseHelper dbHelper;
 
-  const InventoryCard({
-    super.key,
-    required this.docRef,
-    required this.name,
-    required this.imageUrl,
-    required this.quantity,
-    required this.theme,
-    required this.canEdit,
-    required this.currentUser,
-  });
+  const _InventoryGrid({required this.searchQuery, required this.managerId, required this.currentUser, required this.dbHelper});
 
-  // --- دالة التتبع (محدثة للأوفلاين بلمس البيانات محلياً أولاً) ---
-  void _logActivity(String action, String details) {
-    FirebaseFirestore.instance.collection('activity_logs').add({
-      'cafeId': currentUser.cafeId,
-      'userName': currentUser.name,
-      'action': action,
-      'details': details,
-      'timestamp': FieldValue.serverTimestamp(),
-    });
-  }
+  @override
+  State<_InventoryGrid> createState() => _InventoryGridState();
+}
 
-  // --- نافذة تعديل الكمية (محدثة للأوفلاين) ---
-  void _showEditQuantityDialog(BuildContext context) {
-    final qtyController = TextEditingController(text: quantity.toInt().toString());
-
-    showDialog(
-      context: context,
-      builder: (ctx) => AlertDialog(
-        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(20)),
-        title: Text("تعديل كمية ($name)", textAlign: TextAlign.center),
-        content: Column(
-          mainAxisSize: MainAxisSize.min,
-          children: [
-            TextField(
-              controller: qtyController,
-              keyboardType: TextInputType.number,
-              textAlign: TextAlign.center,
-              autofocus: true,
-              decoration: const InputDecoration(labelText: "الكمية الجديدة", border: OutlineInputBorder()),
-            ),
-          ],
-        ),
-        actions: [
-          TextButton(onPressed: () => Navigator.pop(ctx), child: const Text("إلغاء")),
-          ElevatedButton(
-            onPressed: () {
-              double newQty = double.tryParse(qtyController.text) ?? 0;
-
-              // ✅ التعديل للأوفلاين: التحديث محلياً فوراً دون انتظار await
-              docRef.update({'quantity': newQty});
-
-              _logActivity("تعديل مخزن", "عدّل كمية '$name' إلى (${newQty.toInt()})");
-
-              Navigator.pop(ctx);
-              ScaffoldMessenger.of(context).showSnackBar(
-                  const SnackBar(content: Text("تم تحديث المخزن محلياً وسيتم المزامنة 📶"))
-              );
-            },
-            child: const Text("حفظ"),
-          ),
-        ],
-      ),
-    );
-  }
-
-  // --- نافذة الحذف (محدثة للأوفلاين) ---
-  void _deleteItem(BuildContext context) {
-    showDialog(
-      context: context,
-      builder: (ctx) => AlertDialog(
-        title: const Text("تأكيد الحذف 🗑️"),
-        content: Text("حذف ($name) من المخزن؟"),
-        actions: [
-          TextButton(onPressed: () => Navigator.pop(ctx), child: const Text("تراجع")),
-          ElevatedButton(
-            style: ElevatedButton.styleFrom(backgroundColor: Colors.red, foregroundColor: Colors.white),
-            onPressed: () {
-              // ✅ التعديل للأوفلاين: الحذف محلياً فوراً دون انتظار await
-              _logActivity("حذف من المخزن", "قام بحذف الصنف '$name'");
-              docRef.delete();
-
-              Navigator.pop(ctx);
-              ScaffoldMessenger.of(context).showSnackBar(
-                  const SnackBar(content: Text("تم حذف الصنف محلياً 📶"))
-              );
-            },
-            child: const Text("نعم، احذف"),
-          ),
-        ],
-      ),
-    );
-  }
+class _InventoryGridState extends State<_InventoryGrid> with AutomaticKeepAliveClientMixin {
+  @override
+  bool get wantKeepAlive => true;
 
   @override
   Widget build(BuildContext context) {
-    final bool isLowStock = quantity > 0 && quantity <= 5;
-    final bool isOutOfStock = quantity <= 0;
-    Color qtyColor = isOutOfStock ? theme.colorScheme.error : (isLowStock ? Colors.orange.shade700 : Colors.green.shade700);
+    super.build(context);
+    return StreamBuilder<QuerySnapshot>(
+      stream: FirebaseFirestore.instance.collection('inventory').where('cafeId', isEqualTo: widget.currentUser.cafeId).snapshots(),
+      builder: (context, snapshot) {
+        if (!snapshot.hasData) return const Center(child: CircularProgressIndicator());
+        
+        final docs = snapshot.data!.docs.where((doc) {
+          final data = doc.data() as Map<String, dynamic>;
+          if (data['parentId'] != widget.managerId) return false;
+          if (widget.searchQuery.isEmpty) return true;
+          return data['name'].toString().toLowerCase().contains(widget.searchQuery);
+        }).toList();
 
-    return Container(
-      decoration: BoxDecoration(
-        color: theme.cardColor,
-        borderRadius: BorderRadius.circular(20),
-        boxShadow: [BoxShadow(color: Colors.black.withOpacity(0.04), blurRadius: 8)],
-      ),
-      child: Stack(
+        if (docs.isEmpty) return const Center(child: Text("لا توجد نتائج"));
+
+        return GridView.builder(
+          padding: const EdgeInsets.all(20),
+          gridDelegate: const SliverGridDelegateWithMaxCrossAxisExtent(maxCrossAxisExtent: 250, childAspectRatio: 0.75, crossAxisSpacing: 15, mainAxisSpacing: 15),
+          itemCount: docs.length,
+          itemBuilder: (context, index) {
+            final data = docs[index].data() as Map<String, dynamic>;
+            return _buildItemCard(docs[index].id, docs[index].reference, data);
+          },
+        );
+      },
+    );
+  }
+
+  Widget _buildItemCard(String docId, DocumentReference ref, Map<String, dynamic> data) {
+    double qty = (data['quantity'] ?? 0.0).toDouble();
+    bool isLow = qty <= (data['low_stock_threshold'] ?? 5.0).toDouble();
+    
+    return Card(
+      elevation: 0,
+      shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(20), side: BorderSide(color: isLow ? Colors.red.shade100 : Colors.grey[200]!)),
+      child: Column(
+        mainAxisAlignment: MainAxisAlignment.center,
         children: [
-          Column(
-            crossAxisAlignment: CrossAxisAlignment.stretch,
-            children: [
-              Expanded(
-                child: ClipRRect(
-                  borderRadius: const BorderRadius.vertical(top: Radius.circular(20)),
-                  child: Image.network(imageUrl, fit: BoxFit.cover,
-                    errorBuilder: (_, __, ___) => Container(color: Colors.grey[200], child: const Icon(Icons.image)),
-                  ),
-                ),
-              ),
-              Padding(
-                padding: const EdgeInsets.all(10.0),
-                child: Column(
-                  children: [
-                    Text(name, style: const TextStyle(fontWeight: FontWeight.bold), maxLines: 1),
-                    Text("المتوفر: ${quantity.toInt()}", style: TextStyle(color: qtyColor, fontWeight: FontWeight.bold)),
-                    const SizedBox(height: 8),
-                    if (canEdit)
-                      SizedBox(
-                        width: double.infinity,
-                        child: OutlinedButton(
-                          onPressed: () => _showEditQuantityDialog(context),
-                          child: const Text("تعديل"),
-                        ),
-                      ),
-                  ],
-                ),
-              ),
-            ],
+          Container(
+            padding: const EdgeInsets.all(12),
+            decoration: BoxDecoration(color: isLow ? Colors.red[50] : Colors.blue[50], shape: BoxShape.circle),
+            child: Icon(Icons.inventory_2_rounded, size: 30, color: isLow ? Colors.red : Colors.blue),
           ),
-          if (canEdit)
-            Positioned(
-              top: 8, right: 8,
-              child: GestureDetector(
-                onTap: () => _deleteItem(context),
-                child: CircleAvatar(radius: 15, backgroundColor: Colors.white70, child: Icon(Icons.delete, color: theme.colorScheme.error, size: 18)),
-              ),
-            ),
+          const SizedBox(height: 10),
+          Text(data['name'] ?? "", style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 14), textAlign: TextAlign.center),
+          const SizedBox(height: 4),
+          Text("${qty} ${data['unit'] ?? ''}", style: TextStyle(color: isLow ? Colors.red[900] : Colors.black87, fontWeight: FontWeight.bold, fontSize: 12)),
+          const Divider(),
+          // الأزرار التفاعلية - محمية بالصلاحيات
+          Row(
+            mainAxisAlignment: MainAxisAlignment.center,
+            children: [
+              // زر التحويل للمنيو (بيع الصنف)
+              if (widget.currentUser.canUpdate('menu'))
+                IconButton(
+                  tooltip: "عرض للبيع في المنيو",
+                  icon: const Icon(Icons.sell_outlined, color: Colors.orange, size: 20),
+                  onPressed: () {
+                    Navigator.push(context, MaterialPageRoute(builder: (_) => AddProduct(
+                      currentUser: widget.currentUser,
+                      productToEdit: {
+                        'id': docId,
+                        'name': data['name'],
+                        'costPrice': data['costPrice'] ?? 0.0,
+                        'barcode': data['barcode'] ?? "",
+                        'trackInventory': true,
+                      },
+                    )));
+                  }
+                ),
+              if (widget.currentUser.canUpdate('inventory'))
+                IconButton(
+                  icon: const Icon(Icons.edit_rounded, size: 18), 
+                  onPressed: () => InventoryDialogs.showEditInventoryItem(context: context, ref: ref, data: data, currentUser: widget.currentUser)
+                ),
+              if (widget.currentUser.canDelete('inventory'))
+                IconButton(
+                  icon: const Icon(Icons.delete_outline_rounded, size: 18, color: Colors.red), 
+                  onPressed: () => InventoryDialogs.showConfirmDelete(context: context, ref: ref, name: data['name'] ?? "", currentUser: widget.currentUser)
+                ),
+            ],
+          )
         ],
       ),
     );

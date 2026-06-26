@@ -1,16 +1,20 @@
-enum UserRole { admin, manager, cashier, waiter, kitchen, cleaner }
+enum UserRole { super_admin, admin, manager, cashier, waiter, kitchen, cleaner, custom }
 
 class User {
   final String id;
   final String name;
-  final String email;
-   final String password;
+  final String email; 
+  final String password;
   final UserRole role;
-  final String cafeId; // معرف الكافيه التابع له المستخدم
+  final String cafeId;
+  final String? parentId; 
   final String? profileImageUrl;
-  final Map<String, dynamic> permissions;
+  final Map<String, dynamic> permissions; // الهيكل الجديد: {"debts": {"r": true, "c": false, "u": false, "d": false}}
   final bool isOnline;
   final bool isActive;
+  final String? deviceId; 
+  final String? workStartTime;
+  final String? workEndTime;
 
   User({
     required this.id,
@@ -18,55 +22,116 @@ class User {
     required this.email,
     required this.password,
     required this.role,
-    required this.cafeId, // الحقل المطلوب
+    required this.cafeId,
+    this.parentId,
     this.profileImageUrl,
     this.permissions = const {},
     required this.isOnline,
     required this.isActive,
+    this.deviceId,
+    this.workStartTime,
+    this.workEndTime,
   });
 
-  // --- الصلاحيات الذكية (التحكم في الظهور والإخفاء بناءً على الرتبة أو الصلاحيات الممنوحة) ---
+  // دالة فحص الصلاحيات الشاملة
+  bool hasPermission(String page, String action) {
+    if (role == UserRole.super_admin || role == UserRole.admin) return true;
+    
+    final pagePerms = permissions[page];
+    if (pagePerms == null || pagePerms is! Map) return false;
+    
+    return pagePerms[action] == true;
+  }
 
-  // الإدارة العامة والتقارير والداشبورد
-  bool get canManageUsers => _check(permissions['canManageUsers']) || role == UserRole.admin;
-  bool get canViewReports => _check(permissions['canViewReports']) || role == UserRole.admin;
+  // اختصارات CRUD
+  bool canRead(String page) => hasPermission(page, 'r');
+  bool canCreate(String page) => hasPermission(page, 'c');
+  bool canUpdate(String page) => hasPermission(page, 'u');
+  bool canDelete(String page) => hasPermission(page, 'd');
 
-  // صلاحية المخزن
-  bool get canViewInventory => permissions['canViewInventory'] == true;
-
-  // صلاحية الداشبورد (لوحة الإحصائيات)
-  bool get canViewDashboard => permissions['canViewDashboard'] == true;
-
-  // المنيو والطاولات
-  bool get canEditMenu => _check(permissions['canEditMenu']) || role == UserRole.admin;
-  bool get canManageTables => _check(permissions['canManageTables']) || role == UserRole.admin;
-  bool get canEditTable => _check(permissions['canEditTable']) || role == UserRole.admin || role == UserRole.manager;
-
-  // الطلبات والمطبخ
-  bool get canMakeOrders => _check(permissions['canMakeOrders']) || (role != UserRole.cleaner && role != UserRole.kitchen);
-  bool get canPayOrders => _check(permissions['canPayOrders']) || role == UserRole.admin || role == UserRole.cashier;
-  bool get canViewActiveOrders => _check(permissions['canViewActiveOrders']) || role != UserRole.cleaner;
-  bool get canViewKitchen => permissions['canViewKitchen'] == true;
-
-  // دالة مساعدة للتأكد من القيمة المنطقية وتجنب الـ null
-  bool _check(dynamic value) => value == true;
+  // توافق مع الأكواد القديمة - ربط الجيترز القديمة بالنظام الجديد
+  bool get canManageUsers => canUpdate('users') || canRead('users');
+  bool get canViewReports => canRead('reports');
+  bool get canViewInventory => canRead('inventory');
+  bool get canViewDashboard => canRead('dashboard');
+  bool get canEditMenu => canUpdate('menu');
+  bool get canManageTables => canUpdate('tables');
+  bool get canEditTable => canUpdate('tables');
+  bool get canMakeOrders => canCreate('orders');
+  bool get canPayOrders => canUpdate('orders');
+  bool get canViewActiveOrders => canRead('orders');
+  bool get canViewKitchen => canRead('kitchen');
+  bool get canDeleteOrders => canDelete('orders');
+  bool get canTransferOrders => canUpdate('orders');
+  bool get canTransferItems => canUpdate('orders');
+  bool get canManageSettings => canUpdate('settings');
+  bool get canViewDebts => canRead('debts');
+  bool get canManageDebts => canUpdate('debts') || canCreate('debts');
 
   factory User.fromMap(Map<String, dynamic> data, String documentId) {
     return User(
       id: documentId,
-      cafeId: data['cafeId'] ?? '', // ✅ جلب الـ cafeId من Firestore
+      cafeId: data['cafeId'] ?? '',
+      parentId: data['parentId'],
       name: data['name'] ?? 'بدون اسم',
-      email: data['email'] ?? '',
+      email: data['username'] ?? data['email'] ?? '', 
       isActive: data['isActive'] ?? true,
       password: data['password'] ?? '',
       isOnline: data['isOnline'] ?? false,
       profileImageUrl: data['profileImageUrl'],
-      // التأكد من تحويل الصلاحيات لخريطة بشكل آمن
+      deviceId: data['deviceId'],
+      workStartTime: data['workStartTime'],
+      workEndTime: data['workEndTime'],
       permissions: data['permissions'] is Map ? Map<String, dynamic>.from(data['permissions']) : {},
       role: UserRole.values.firstWhere(
             (e) => e.name == (data['role'] ?? 'waiter'),
         orElse: () => UserRole.waiter,
       ),
+    );
+  }
+
+  Map<String, dynamic> toMap() {
+    return {
+      'name': name,
+      'email': email,
+      'username': email,
+      'password': password,
+      'role': role.name,
+      'cafeId': cafeId,
+      'parentId': parentId,
+      'isActive': isActive,
+      'isOnline': isOnline,
+      'permissions': permissions,
+      'profileImageUrl': profileImageUrl,
+      'deviceId': deviceId,
+      'workStartTime': workStartTime,
+      'workEndTime': workEndTime,
+    };
+  }
+
+  User copyWith({
+    String? name,
+    Map<String, dynamic>? permissions,
+    String? cafeId,
+    bool? isActive,
+    bool? isOnline,
+    UserRole? role,
+  }) {
+    return User(
+      id: id,
+      name: name ?? this.name,
+      email: email,
+      password: password,
+      role: role ?? this.role,
+      cafeId: cafeId ?? this.cafeId,
+      permissions: permissions ?? this.permissions,
+      parentId: parentId,
+      isOnline: isOnline ?? this.isOnline,
+      isActive: isActive ?? this.isActive,
+      profileImageUrl: profileImageUrl,
+      deviceId: deviceId,
+      workStartTime: workStartTime,
+      workEndTime: workEndTime,
     );
   }
 }

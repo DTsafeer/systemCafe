@@ -13,12 +13,54 @@ class CafeAccountsPage extends StatefulWidget {
 class _CafeAccountsPageState extends State<CafeAccountsPage> {
   final FirebaseFirestore _firestore = FirebaseFirestore.instance;
 
+  // دالة لإظهار حوار التأكيد لإلغاء الارتباط
+  void _showUnlinkDialog(BuildContext context, String userId, String userName) {
+    showDialog(
+      context: context,
+      builder: (ctx) => Directionality(
+        textDirection: TextDirection.rtl,
+        child: AlertDialog(
+          title: const Text("إلغاء ارتباط الجهاز"),
+          content: Text("هل أنت متأكد من رغبتك في إلغاء ارتباط الجهاز الحالي بحساب الموظف ($userName)؟\n\nهذا الإجراء سيسمح للموظف بتسجيل الدخول من جهاز آخر."),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.pop(ctx),
+              child: const Text("إلغاء"),
+            ),
+            ElevatedButton(
+              style: ElevatedButton.styleFrom(backgroundColor: Colors.red),
+              onPressed: () async {
+                try {
+                  await _firestore.collection('users').doc(userId).update({
+                    'deviceId': FieldValue.delete(), // حذف معرف الجهاز نهائياً
+                  });
+                  if (context.mounted) {
+                    Navigator.pop(ctx);
+                    ScaffoldMessenger.of(context).showSnackBar(
+                      SnackBar(content: Text("تم إلغاء ارتباط جهاز الموظف $userName بنجاح")),
+                    );
+                  }
+                } catch (e) {
+                  if (context.mounted) {
+                    ScaffoldMessenger.of(context).showSnackBar(
+                      SnackBar(content: Text("حدث خطأ: $e")),
+                    );
+                  }
+                }
+              },
+              child: const Text("إلغاء الارتباط الآن", style: TextStyle(color: Colors.white)),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
   @override
   Widget build(BuildContext context) {
     return Scaffold(
       backgroundColor: Colors.grey[100],
       appBar: AppBar(
-
         title: const Text("حسابات المنشآت والموظفين"),
         centerTitle: true,
         actions: [
@@ -35,7 +77,6 @@ class _CafeAccountsPageState extends State<CafeAccountsPage> {
         ],
       ),
       body: StreamBuilder<QuerySnapshot>(
-        // جلب جميع الكافيهات
         stream: _firestore.collection('cafes').snapshots(),
         builder: (context, cafeSnapshot) {
           if (!cafeSnapshot.hasData) return const Center(child: CircularProgressIndicator());
@@ -50,7 +91,7 @@ class _CafeAccountsPageState extends State<CafeAccountsPage> {
               final String cafeId = cafe.id;
 
               return Card(
-                margin: const EdgeInsets.all(8.0),
+                margin: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
                 shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(15)),
                 child: ExpansionTile(
                   leading: const Icon(Icons.business, color: Colors.blue),
@@ -61,7 +102,6 @@ class _CafeAccountsPageState extends State<CafeAccountsPage> {
                   subtitle: Text("كود المنشأة: $cafeId", style: const TextStyle(fontSize: 12)),
                   children: [
                     const Divider(),
-                    // جلب المستخدمين التابعين لهذا الكافيه فقط
                     StreamBuilder<QuerySnapshot>(
                       stream: _firestore
                           .collection('users')
@@ -74,7 +114,7 @@ class _CafeAccountsPageState extends State<CafeAccountsPage> {
 
                         if (users.isEmpty) {
                           return const Padding(
-                            padding: EdgeInsets.all(8.0),
+                            padding: EdgeInsets.all(16.0),
                             child: Text("لا يوجد موظفين مسجلين حالياً"),
                           );
                         }
@@ -84,6 +124,7 @@ class _CafeAccountsPageState extends State<CafeAccountsPage> {
                             final userData = userDoc.data() as Map<String, dynamic>;
                             final bool isActive = userData['isActive'] ?? true;
                             final String role = userData['role'] ?? "موظف";
+                            final String? deviceId = userData['deviceId'];
 
                             return ListTile(
                               leading: CircleAvatar(
@@ -94,18 +135,38 @@ class _CafeAccountsPageState extends State<CafeAccountsPage> {
                                   color: role == 'admin' ? Colors.orange : Colors.blue,
                                 ),
                               ),
-                              title: Text(userData['name'] ?? "بدون اسم"),
+                              title: Row(
+                                children: [
+                                  Text(userData['name'] ?? "بدون اسم"),
+                                  if (deviceId != null)
+                                    const Padding(
+                                      padding: EdgeInsets.symmetric(horizontal: 8),
+                                      child: Icon(Icons.phonelink_lock, size: 14, color: Colors.green),
+                                    ),
+                                ],
+                              ),
                               subtitle: Text("الصلاحية: $role"),
-                              trailing: Switch(
-                                value: isActive,
-                                activeColor: Colors.green,
-                                onChanged: (val) {
-                                  // تحديث حالة الموظف في الفايربيز
-                                  _firestore
-                                      .collection('users')
-                                      .doc(userDoc.id)
-                                      .update({'isActive': val});
-                                },
+                              trailing: Row(
+                                mainAxisSize: MainAxisSize.min,
+                                children: [
+                                  // زر إلغاء الارتباط يظهر فقط إذا كان هناك جهاز مرتبط
+                                  if (deviceId != null)
+                                    IconButton(
+                                      icon: const Icon(Icons.phonelink_erase, color: Colors.redAccent),
+                                      tooltip: "إلغاء ارتباط الجهاز",
+                                      onPressed: () => _showUnlinkDialog(context, userDoc.id, userData['name'] ?? "الموظف"),
+                                    ),
+                                  Switch(
+                                    value: isActive,
+                                    activeColor: Colors.green,
+                                    onChanged: (val) {
+                                      _firestore
+                                          .collection('users')
+                                          .doc(userDoc.id)
+                                          .update({'isActive': val});
+                                    },
+                                  ),
+                                ],
                               ),
                             );
                           }).toList(),

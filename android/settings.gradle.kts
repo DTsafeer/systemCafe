@@ -19,8 +19,8 @@ pluginManagement {
 plugins {
     id("dev.flutter.flutter-plugin-loader") version "1.0.0"
     id("com.android.application") version "8.7.0" apply false
-    // تحديث إصدار Kotlin لحل مشكلة التوافق
-    id("org.jetbrains.kotlin.android") version "1.9.22" apply false
+    // تحديث إصدار Kotlin إلى 2.1.0 لحل مشكلة التوافق مع المكتبات الحديثة
+    id("org.jetbrains.kotlin.android") version "2.1.0" apply false
 }
 
 include(":app")

@@ -2,66 +2,66 @@ import 'package:cloud_firestore/cloud_firestore.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import 'user_model.dart';
 import 'package:firebase_messaging/firebase_messaging.dart';
+
 class UserDatabase {
   static final CollectionReference _userCollection = FirebaseFirestore.instance.collection('users');
 
-  // التحقق من تسجيل الدخول
-  static Future<User?> authenticate(String email, String password) async {
-    final query = await _userCollection
-        .where('email', isEqualTo: email.trim())
-        .where('password', isEqualTo: password.trim())
-        .get();
+  /// جلب الموظفين التابعين لكافيه معين فقط
+  /// تم إزالة الفلترة بـ parentId هنا للسماح للمديرين برؤية زملائهم الموظفين في نفس الكافيه
+  static Stream<List<User>> getCafeEmployees(String cafeId) {
+    return _userCollection
+        .where('cafeId', isEqualTo: cafeId)
+        .snapshots()
+        .map((snapshot) {
+      return snapshot.docs
+          .map((doc) => User.fromMap(doc.data() as Map<String, dynamic>, doc.id))
+          .toList();
+    });
+  }
 
-    if (query.docs.isNotEmpty) {
-      return User.fromMap(query.docs.first.data() as Map<String, dynamic>, query.docs.first.id);
+  /// التحقق من تسجيل الدخول عبر البحث في القاعدة وليس عبر الـ ID مباشرة
+  /// هذا يحل مشكلة التداخل إذا وُجد نفس اسم المستخدم في كافيهات مختلفة
+  static Future<User?> authenticate(String username, String password) async {
+    try {
+      final query = await _userCollection
+          .where('username', isEqualTo: username.trim().toLowerCase())
+          .where('password', isEqualTo: password.trim())
+          .limit(1)
+          .get();
+
+      if (query.docs.isNotEmpty) {
+        return User.fromMap(query.docs.first.data() as Map<String, dynamic>, query.docs.first.id);
+      }
+    } catch (e) {
+      print("Auth error: $e");
     }
     return null;
   }
 
-  // حفظ الجلسة
-  static Future<void> saveSession(String email, String password) async {
-    final prefs = await SharedPreferences.getInstance();
-    await prefs.setString('email', email);
-    await prefs.setString('password', password);
-  }
-
-  static Future<Map<String, String?>?> getSavedSession() async {
-    final prefs = await SharedPreferences.getInstance();
-    if (prefs.containsKey('email')) {
-      return {'email': prefs.getString('email'), 'password': prefs.getString('password')};
+  static Future<void> updateOnlineStatus(String userId, bool status) async {
+    try {
+      await _userCollection.doc(userId).update({'isOnline': status});
+    } catch (e) {
+      print("Status update error: $e");
     }
-    return null;
   }
 
   static Future<void> logout() async {
     final prefs = await SharedPreferences.getInstance();
     await prefs.clear();
   }
-  static Future<void> updateOnlineStatus(String userId, bool status) async {
-    await FirebaseFirestore.instance
-        .collection('users')
-        .doc(userId)
-        .update({'isOnline': status});
-  }
-
-  // استيراد مكتبة الفايربيز ماسيجينج في الأعلى
-// import 'package:firebase_messaging/firebase_messaging.dart';
 
   static Future<void> updateFcmToken(String userId) async {
     try {
-      // 1. طلب التوكن الفريد لهذا الجهاز
       String? token = await FirebaseMessaging.instance.getToken();
-
       if (token != null) {
-        // 2. حفظه في مستند المستخدم لكي نتمكن من مراسلته لاحقاً
         await _userCollection.doc(userId).update({
           'fcmToken': token,
           'lastTokenUpdate': FieldValue.serverTimestamp(),
         });
-        print("✅ تم تحديث رمز الإشعارات بنجاح");
       }
     } catch (e) {
-      print("❌ خطأ في تحديث رمز الإشعارات: $e");
+      print("FCM Token error: $e");
     }
   }
 }

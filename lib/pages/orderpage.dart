@@ -1,494 +1,1442 @@
 import 'dart:async';
-import 'dart:convert';
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'package:cloud_firestore/cloud_firestore.dart';
-import 'package:http/http.dart' as http;
-import 'package:image_picker/image_picker.dart';
+import 'package:intl/intl.dart' as intl;
+import '../services/order_service.dart';
+import '../services/inventory_service.dart';
+import '../services/debt_service.dart';
+import '../services/cafe_service.dart';
+import '../services/table_service.dart';
+import '../services/transfer_service.dart';
+import '../widgets/app_components.dart';
+import '../widgets/category_grid_view.dart';
 import 'user_model.dart';
+import 'addproduct.dart';
 
 class OrderPage extends StatefulWidget {
-  final String tableName;
   final User currentUser;
+  final String tableId;
+  final String tableName;
+  final Map<String, dynamic>? restoreData;
 
-  const OrderPage({super.key, required this.tableName, required this.currentUser});
+  const OrderPage({
+    super.key,
+    required this.currentUser,
+    required this.tableId,
+    required this.tableName,
+    this.restoreData,
+  });
 
   @override
   State<OrderPage> createState() => _OrderPageState();
 }
 
 class _OrderPageState extends State<OrderPage> with TickerProviderStateMixin {
-  final CollectionReference productsRef = FirebaseFirestore.instance.collection('products');
-  final Map<String, Map<String, dynamic>> selectedProducts = {};
-  TabController? _tabController;
-  List<String> _currentCategories = [];
+  final ValueNotifier<Map<String, Map<String, dynamic>>> cartNotifier = ValueNotifier({});
+  final ValueNotifier<String> searchNotifier = ValueNotifier("");
+  final ValueNotifier<Map<String, double>> inventoryNotifier = ValueNotifier({});
 
   final TextEditingController _searchController = TextEditingController();
-  String _searchQuery = "";
-  bool _isSearching = false;
+  final TextEditingController _nameController = TextEditingController();
+  final TextEditingController _phoneController = TextEditingController();
+  final TextEditingController _receivedAmountController = TextEditingController();
 
-  final String cloudName = "dbjnnbhaw";
-  final String uploadPreset = "floracafe";
+  final FocusNode _barcodeFieldFocusNode = FocusNode();
+  final TextEditingController _barcodeInputController = TextEditingController();
+
+  List<String> _paymentMethods = ["كاش", "شبكة", "دين"];
+  String? _activeCafeId;
+  CafeSettings? _settings;
+  StreamSubscription? _settingsSub;
+  StreamSubscription? _inventorySub;
+  StreamSubscription? _debtSub;
+  StreamSubscription? _tablesSub;
+  StreamSubscription? _productsSub;
+  StreamSubscription? _tableSub;
+  Timer? _debounce;
+  Timer? _timerTick;
+
+  TabController? _tabController;
+  List<Map<String, String>> _customerSuggestions = [];
+  List<Map<String, dynamic>> _allTables = [];
+  String? _selectedCustomerId;
+  String? _selectedCustomerBalance;
+  double? _selectedCustomerLimit;
+
+  List<DocumentSnapshot> _allProducts = [];
+  Map<String, dynamic>? _tableData;
+  double _currentTimerPrice = 0.0;
+
+  Stream<QuerySnapshot>? _pendingOrdersStream;
 
   @override
-  void dispose() {
-    _tabController?.dispose();
-    _searchController.dispose();
-    super.dispose();
+  void initState() {
+    super.initState();
+    _initCafeData();
+    _searchController.addListener(_onSearchChanged);
+    if (widget.restoreData != null) _restoreOrder(widget.restoreData!);
+
+    _timerTick = Timer.periodic(const Duration(seconds: 10), (timer) {
+      if (mounted) _calculateTimerPrice();
+    });
   }
 
-  // دالة تسجيل النشاط (Tracking)
-  Future<void> _logAction(String action, String details) async {
-    try {
-      await FirebaseFirestore.instance.collection('activity_logs').add({
-        'cafeId': widget.currentUser.cafeId,
-        'userName': widget.currentUser.name,
-        'action': action,
-        'details': details,
-        'timestamp': FieldValue.serverTimestamp(),
-      });
-    } catch (e) {
-      debugPrint("خطأ في تسجيل النشاط: $e");
-    }
+  void _restoreOrder(Map<String, dynamic> data) {
+    Map<String, Map<String, dynamic>> restoredCart = {};
+    for (var item in (data['items'] as List)) restoredCart[item['id']] = Map<String, dynamic>.from(item);
+    cartNotifier.value = restoredCart;
+    _nameController.text = data['customer_name'] ?? "";
+    _phoneController.text = data['customer_phone'] ?? "";
+    _selectedCustomerId = data['selectedCustomerId'];
   }
 
-  void _updateTabController(List<String> newCategories) {
-    List<String> finalCategories = ["الكل", ...newCategories];
-    if (_currentCategories.join(',') != finalCategories.join(',')) {
-      _currentCategories = finalCategories;
-      _tabController?.dispose();
-      _tabController = TabController(length: finalCategories.length, vsync: this);
-      Future.delayed(Duration.zero, () { if (mounted) setState(() {}); });
-    }
-  }
-
-  void updateQuantity(String productId, Map<String, dynamic> productData, double newQuantity) {
-    setState(() {
-      if (newQuantity <= 0) {
-        selectedProducts.remove(productId);
-      } else {
-        selectedProducts[productId] = {
-          ...productData,
-          'quantity': newQuantity,
-        };
+  void _onSearchChanged() {
+    if (_debounce?.isActive ?? false) _debounce?.cancel();
+    _debounce = Timer(const Duration(milliseconds: 300), () {
+      if (mounted) {
+        searchNotifier.value = _searchController.text.trim().toLowerCase();
       }
     });
   }
 
-  // --- نافذة تعديل المنتج مع التتبع ---
-  void _showEditProductDialog(String productId, Map<String, dynamic> data) {
-    if (widget.currentUser.permissions['canEditMenu'] != true) return;
-    final nameController = TextEditingController(text: data['name']);
-    final priceController = TextEditingController(text: data['price'].toString());
-    String? newImageUrl = data['image'] ?? data['image_url'];
-    bool isUploading = false;
-    final theme = Theme.of(context);
+  Future<void> _initCafeData() async {
+    String cid = widget.currentUser.cafeId;
+    if (cid.isEmpty) cid = await CafeService.getActiveCafeId();
+    final String managerId = widget.currentUser.parentId ?? widget.currentUser.id;
 
-    showDialog(context: context, builder: (ctx) => StatefulBuilder(builder: (context, setDialogState) {
-      return AlertDialog(
-        backgroundColor: theme.cardColor,
-        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(20)),
-        title: const Text("تعديل المنتج"),
-        content: SingleChildScrollView(
-          child: Column(mainAxisSize: MainAxisSize.min, children: [
-            GestureDetector(
-              onTap: () async {
-                final picker = ImagePicker();
-                final XFile? image = await picker.pickImage(source: ImageSource.gallery, imageQuality: 50);
-                if (image == null) return;
-                setDialogState(() => isUploading = true);
-                try {
-                  final url = Uri.parse('https://api.cloudinary.com/v1_1/$cloudName/image/upload');
-                  var request = http.MultipartRequest('POST', url)
-                    ..fields['upload_preset'] = uploadPreset
-                    ..files.add(await http.MultipartFile.fromPath('file', image.path));
-                  var response = await http.Response.fromStream(await request.send());
-                  var responseData = jsonDecode(response.body);
-                  if (response.statusCode == 200) {
-                    setDialogState(() => newImageUrl = responseData['secure_url']);
-                  }
-                } catch (e) {
-                  debugPrint("خطأ في الرفع: $e");
-                } finally {
-                  setDialogState(() => isUploading = false);
-                }
-              },
-              child: Container(
-                width: 120, height: 120, clipBehavior: Clip.antiAlias,
-                decoration: BoxDecoration(color: theme.colorScheme.primary.withOpacity(0.1), borderRadius: BorderRadius.circular(15)),
-                child: isUploading
-                    ? Center(child: CircularProgressIndicator(color: theme.colorScheme.primary))
-                    : (newImageUrl != null && newImageUrl!.isNotEmpty ? Image.network(newImageUrl!, fit: BoxFit.cover) : Icon(Icons.add_a_photo, color: theme.colorScheme.primary)),
-              ),
-            ),
-            const SizedBox(height: 15),
-            TextField(controller: nameController, decoration: const InputDecoration(labelText: "اسم المنتج")),
-            const SizedBox(height: 10),
-            TextField(controller: priceController, keyboardType: TextInputType.number, decoration: const InputDecoration(labelText: "السعر")),
-          ]),
-        ),
-        actions: [
-          TextButton(onPressed: () => Navigator.pop(ctx), child: const Text("إلغاء")),
-          ElevatedButton(
-            onPressed: () async {
-              String oldName = data['name'];
-              String newName = nameController.text.trim();
-              double newPrice = double.tryParse(priceController.text) ?? 0.0;
+    if (mounted) {
+      setState(() {
+        _activeCafeId = cid;
+        if (cid.isNotEmpty && widget.tableId != "takeaway") {
+          _pendingOrdersStream = FirebaseFirestore.instance
+              .collection('orders')
+              .where('cafeId', isEqualTo: cid)
+              .where('table', isEqualTo: widget.tableName)
+              .where('paid', isEqualTo: false)
+              .snapshots();
 
-              await productsRef.doc(productId).update({
-                'name': newName,
-                'price': newPrice,
-                'image': newImageUrl,
+          _tableSub = FirebaseFirestore.instance.collection('tables').doc(widget.tableId).snapshots().listen((snap) {
+            if (mounted && snap.exists) {
+              setState(() {
+                _tableData = snap.data();
+                _calculateTimerPrice();
               });
-
-              // ✅ تتبع التعديل
-              await _logAction("تعديل منتج", "تم تعديل '$oldName' إلى '$newName' بسعر $newPrice");
-
-              Navigator.pop(ctx);
-            },
-            child: const Text("حفظ"),
-          ),
-        ],
-      );
-    }));
-  }
-
-  // --- نافذة تأكيد الحذف مع التتبع ---
-  void _confirmDelete(String productId, String productName) {
-    showDialog(
-      context: context,
-      builder: (ctx) => AlertDialog(
-        title: const Text("تأكيد الحذف"),
-        content: Text("هل أنت متأكد من حذف المنتج '$productName' نهائياً من المنيو والمخزن؟"),
-        actions: [
-          TextButton(onPressed: () => Navigator.pop(ctx), child: const Text("إلغاء")),
-          ElevatedButton(
-            style: ElevatedButton.styleFrom(backgroundColor: Colors.red),
-            onPressed: () async {
-              Navigator.pop(ctx);
-              await productsRef.doc(productId).delete();
-              // ✅ تتبع الحذف
-              await _logAction("حذف منتج", "قام بحذف المنتج '$productName' من المنيو");
-
-              if (mounted) {
-                ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text("تم حذف $productName")));
-              }
-            },
-            child: const Text("حذف", style: TextStyle(color: Colors.white)),
-          ),
-        ],
-      ),
-    );
-  }
-
-  // --- إرسال الطلب مع التتبع الكامل ---
-  // --- إرسال الطلب مع دعم كامل لوضع الأوفلاين ---
-  Future<void> submitOrder() async {
-    if (selectedProducts.isEmpty) return;
-    List<Map<String, dynamic>> itemsList = selectedProducts.values.toList();
-
-    // تجهيز تفاصيل التتبع
-    String orderDetails = itemsList.map((e) => "${e['name']} (${e['quantity']})").join(", ");
-
-    // 1️⃣ التعديل الأول: تصفير السلة وإغلاق الصفحة فوراً (قبل الـ commit)
-    // هذا يضمن أن النادل يمكنه العودة للرئيسية والعمل على طاولة أخرى دون انتظار الإنترنت
-    setState(() => selectedProducts.clear());
-    Navigator.pop(context);
-
-    try {
-      final batch = FirebaseFirestore.instance.batch();
-      final newOrderRef = FirebaseFirestore.instance.collection('orders').doc();
-
-      batch.set(newOrderRef, {
-        'items': itemsList,
-        'cafeId': widget.currentUser.cafeId,
-        'table': widget.tableName,
-        'ordered_at': FieldValue.serverTimestamp(), // فايبربيز سيعالج التوقيت محلياً ثم يصححه عند المزامنة
-        'paid': false,
-        'kitchen_status': 'pending',
-        'waiter_name': widget.currentUser.name,
+            }
+          });
+        }
       });
-
-      DocumentReference notificationRef = FirebaseFirestore.instance.collection('notifications').doc();
-      batch.set(notificationRef, {
-        'cafeId': widget.currentUser.cafeId,
-        'title': '🔔 طلب جديد: طاولة ${widget.tableName}',
-        'body': 'وصلت طلبات جديدة بانتظار التحضير 👨‍🍳',
-        'targetRole': 'kitchen',
-        'isRead': false,
-        'senderName': widget.currentUser.name,
-        'timestamp': FieldValue.serverTimestamp(),
-      });
-
-      for (var item in itemsList) {
-        DocumentReference inventoryDoc = FirebaseFirestore.instance.collection('inventory').doc(item['id']);
-        batch.set(inventoryDoc, {
-          'quantity': FieldValue.increment(-(item['quantity'] as double)),
-          'last_updated': FieldValue.serverTimestamp(),
-        }, SetOptions(merge: true));
+      if (cid.isNotEmpty) {
+        _listenToCafeSettings(cid);
+        _listenToCustomers(cid);
+        _listenToInventory(cid);
+        _listenToAllTables(cid, managerId);
+        _loadAllProducts(cid, managerId);
       }
-
-      DocumentReference logRef = FirebaseFirestore.instance.collection('activity_logs').doc();
-      batch.set(logRef, {
-        'cafeId': widget.currentUser.cafeId,
-        'userName': widget.currentUser.name,
-        'action': "طلب جديد",
-        'details': "طاولة ${widget.tableName}: $orderDetails",
-        'timestamp': FieldValue.serverTimestamp(),
-      });
-
-      // 2️⃣ التعديل الثاني (الأهم): إزالة الـ await من الـ commit
-      // فايبربيز سيقوم بحفظ الـ batch في الذاكرة المحلية (Persistence) فوراً
-      // وسيرسلها للسيرفر تلقائياً في الخلفية عند توفر الإنترنت.
-      batch.commit().catchError((e) {
-        debugPrint("🔴 فشل المزامنة التلقائية: $e");
-      });
-
-      // 3️⃣ التعديل الثالث: إظهار رسالة طمأنة للمستخدم
-      if (mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(
-          const SnackBar(
-            content: Text("تم تسجيل الطلب (سيتم الرفع عند توفر الإنترنت) 📶"),
-            duration: Duration(seconds: 2),
-          ),
-        );
-      }
-    } catch (e) {
-      debugPrint("🔴 خطأ برمي في إعداد الطلب: $e");
     }
   }
-  @override
-  Widget build(BuildContext context) {
-    final theme = Theme.of(context);
-    final primaryColor = theme.colorScheme.primary;
 
-    return StreamBuilder<DocumentSnapshot>(
-      stream: FirebaseFirestore.instance.collection('cafes').doc(widget.currentUser.cafeId).snapshots(),
-      builder: (context, cafeSnap) {
-        String currencySymbol = "₪";
-        if (cafeSnap.hasData && cafeSnap.data!.exists) {
-          currencySymbol = (cafeSnap.data!.data() as Map<String, dynamic>)['currency_symbol'] ?? "₪";
-        }
+  void _calculateTimerPrice() {
+    if (_tableData == null || _settings == null) return;
 
-        return StreamBuilder<QuerySnapshot>(
-          stream: productsRef.where('cafeId', isEqualTo: widget.currentUser.cafeId).snapshots(),
-          builder: (context, prodSnapshot) {
-            if (!prodSnapshot.hasData) return Scaffold(body: Center(child: CircularProgressIndicator(color: primaryColor)));
+    final Timestamp? startTime = _tableData!['start_time'];
+    final int accumulatedSeconds = _tableData!['accumulated_seconds'] ?? 0;
+    final double hourlyRate = _settings!.hourlyRate;
 
-            final productsDocs = prodSnapshot.data!.docs;
-            if (productsDocs.isEmpty) {
-              return Scaffold(
-                appBar: AppBar(backgroundColor: primaryColor, title: Text('طاولة: ${widget.tableName}')),
-                body: const Center(child: Text("لا توجد منتجات مضافة")),
-              );
-            }
+    int totalSeconds = accumulatedSeconds;
+    if (startTime != null) {
+      totalSeconds += DateTime.now().difference(startTime.toDate()).inSeconds;
+    }
 
-            final categories = productsDocs.map((doc) => (doc.data() as Map<String, dynamic>)['category']?.toString() ?? 'عام').toSet().toList()..sort();
-            _updateTabController(categories);
-
-            if (_tabController == null) return Scaffold(body: Center(child: CircularProgressIndicator(color: primaryColor)));
-
-            return Scaffold(
-              backgroundColor: theme.scaffoldBackgroundColor,
-              appBar: AppBar(
-                backgroundColor: primaryColor,
-                foregroundColor: theme.colorScheme.onPrimary,
-                title: _isSearching
-                    ? TextField(
-                  controller: _searchController,
-                  autofocus: true,
-                  style: const TextStyle(color: Colors.white),
-                  decoration: InputDecoration(
-                    hintText: "بحث عن صنف...",
-                    hintStyle: const TextStyle(color: Colors.white70),
-                    border: InputBorder.none,
-                    suffixIcon: IconButton(
-                      icon: const Icon(Icons.close, color: Colors.white),
-                      onPressed: () {
-                        setState(() {
-                          _isSearching = false;
-                          _searchController.clear();
-                          _searchQuery = "";
-                        });
-                      },
-                    ),
-                  ),
-                  onChanged: (val) => setState(() => _searchQuery = val.toLowerCase()),
-                )
-                    : Text('طاولة: ${widget.tableName}'),
-                actions: [
-                  if (!_isSearching)
-                    IconButton(
-                      icon: const Icon(Icons.search),
-                      onPressed: () => setState(() => _isSearching = true),
-                    ),
-                ],
-                bottom: TabBar(
-                  controller: _tabController,
-                  isScrollable: true,
-                  indicatorColor: theme.colorScheme.onPrimary,
-                  labelColor: Colors.white,
-                  unselectedLabelColor: Colors.white70,
-                  tabs: _currentCategories.map((cat) => Tab(text: cat)).toList(),
-                ),
-              ),
-              floatingActionButton: selectedProducts.isNotEmpty
-                  ? FloatingActionButton.extended(
-                onPressed: submitOrder,
-                backgroundColor: primaryColor,
-                label: Text('تأكيد (${selectedProducts.length})'),
-                icon: const Icon(Icons.send),
-              )
-                  : null,
-              body: TabBarView(
-                controller: _tabController,
-                children: _currentCategories.map((cat) {
-                  final filteredProducts = productsDocs.where((doc) {
-                    final data = doc.data() as Map<String, dynamic>;
-                    final name = (data['name'] ?? "").toString().toLowerCase();
-                    final pCategory = data['category'] ?? 'عام';
-                    bool matchesSearch = name.contains(_searchQuery);
-                    bool matchesCategory = (cat == "الكل") || (pCategory == cat);
-                    return matchesSearch && matchesCategory;
-                  }).toList();
-
-                  return GridView.builder(
-                    padding: const EdgeInsets.fromLTRB(12, 12, 12, 80),
-                    gridDelegate: const SliverGridDelegateWithFixedCrossAxisCount(
-                        crossAxisCount: 2, childAspectRatio: 0.7, crossAxisSpacing: 10, mainAxisSpacing: 10),
-                    itemCount: filteredProducts.length,
-                    itemBuilder: (context, index) {
-                      final pDoc = filteredProducts[index];
-                      final pData = pDoc.data() as Map<String, dynamic>;
-                      pData['id'] = pDoc.id;
-
-                      return ModernProductCard(
-                        productData: pData,
-                        theme: theme,
-                        currencySymbol: currencySymbol,
-                        currentUser: widget.currentUser,
-                        onValueChanged: updateQuantity,
-                        onEdit: () => _showEditProductDialog(pDoc.id, pData),
-                        onDelete: () => _confirmDelete(pDoc.id, pData['name']),
-                      );
-                    },
-                  );
-                }).toList(),
-              ),
-            );
-          },
-        );
-      },
-    );
+    setState(() {
+      _currentTimerPrice = ((totalSeconds / 3600) * hourlyRate).roundToDouble();
+    });
   }
-}
 
-// الكلاس الفرعي (ModernProductCard) يبقى كما هو تقريباً مع التأكد من تمرير onDelete بشكل صحيح
-class ModernProductCard extends StatefulWidget {
-  final Map<String, dynamic> productData;
-  final String currencySymbol;
-  final User currentUser;
-  final ThemeData theme;
-  final Function(String, Map<String, dynamic>, double) onValueChanged;
-  final VoidCallback onEdit, onDelete;
+  void _loadAllProducts(String cid, String managerId) {
+    _productsSub = FirebaseFirestore.instance
+        .collection('products')
+        .where('cafeId', isEqualTo: cid)
+        .where('parentId', isEqualTo: managerId)
+        .snapshots()
+        .listen((snap) {
+          if (mounted) setState(() => _allProducts = snap.docs);
+        }, onError: (e) => debugPrint("Products Stream Error: $e"));
+  }
 
-  const ModernProductCard({
-    super.key, required this.productData,
-    required this.theme, required this.onValueChanged,
-    required this.onEdit, required this.onDelete, required this.currentUser,
-    required this.currencySymbol
-  });
+  void _onBarcodeScanned(String code) {
+    if (!mounted) return;
+    final cleanCode = code.trim();
+    if (cleanCode.isEmpty) return;
 
-  @override
-  State<ModernProductCard> createState() => _ModernProductCardState();
-}
+    try {
+      final doc = _allProducts.firstWhere(
+        (p) {
+          final data = p.data() as Map;
+          return data['barcode']?.toString() == cleanCode;
+        },
+      );
 
-class _ModernProductCardState extends State<ModernProductCard> {
-  int quantity = 0;
+      final data = doc.data() as Map<String, dynamic>;
+      _updateCart(doc.id, data, (cartNotifier.value[doc.id]?['quantity'] ?? 0.0) + 1);
 
-  @override
-  Widget build(BuildContext context) {
-    final primaryColor = widget.theme.colorScheme.primary;
-    bool canModify = widget.currentUser.permissions['canEditMenu'] == true;
-    final String imageUrl = widget.productData['image'] ?? '';
-    final String name = widget.productData['name'] ?? 'N/A';
-    final double price = (widget.productData['price'] ?? 0.0).toDouble();
-    final String productId = widget.productData['id'];
+      HapticFeedback.lightImpact();
+      _barcodeInputController.clear();
 
-    return Container(
-      decoration: BoxDecoration(
-          color: widget.theme.cardColor,
-          borderRadius: BorderRadius.circular(20),
-          boxShadow: [BoxShadow(color: Colors.black.withOpacity(0.05), blurRadius: 10)]
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text("✅ تمت إضافة: ${data['name']}"), duration: const Duration(milliseconds: 800), backgroundColor: Colors.green)
+      );
+    } catch (e) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text("❌ الباركود $cleanCode غير مسجل!"), backgroundColor: Colors.orange)
+      );
+      _barcodeInputController.clear();
+    }
+
+    _barcodeFieldFocusNode.requestFocus();
+  }
+
+  void _listenToAllTables(String cid, String managerId) {
+    _tablesSub = TableService.streamTables(cid, managerId).listen((data) {
+      if (mounted) setState(() => _allTables = data);
+    });
+  }
+
+  void _listenToInventory(String cid) {
+    final String managerId = widget.currentUser.parentId ?? widget.currentUser.id;
+    _inventorySub = InventoryService.streamInventory(cid, managerId).listen((items) {
+      if (mounted) {
+        Map<String, double> stocks = {};
+        for (var item in items) stocks[item['id']] = (item['quantity'] ?? 0.0).toDouble();
+        inventoryNotifier.value = stocks;
+      }
+    });
+  }
+
+  void _listenToCustomers(String cid) {
+    final String managerId = widget.currentUser.parentId ?? widget.currentUser.id;
+    _debtSub = DebtService.streamDebts(cid, managerId).listen((data) {
+      if (mounted) {
+        setState(() {
+          _customerSuggestions = data.map((d) => {
+            'name': d['customer']?.toString() ?? "",
+            'phone': d['phone']?.toString() ?? "",
+            'debt': (d['netBalance'] as num).toDouble().toStringAsFixed(1),
+            'id': d['id'].toString(),
+            'limit': (d['debtLimit'] as num? ?? 0.0).toDouble().toString()
+          }).toList();
+        });
+      }
+    });
+  }
+
+  void _listenToCafeSettings(String cid) {
+    _settingsSub = CafeService.streamCafeSettings(cid).listen((settings) {
+      if (mounted) {
+        setState(() {
+          _settings = settings;
+          _paymentMethods = settings.paymentMethods;
+          _calculateTimerPrice();
+        });
+      }
+    });
+  }
+
+  void _updateCart(String id, Map<String, dynamic> data, double qty) {
+    if (!mounted) return;
+
+    final currentQtyInCart = cartNotifier.value[id]?['quantity'] ?? 0.0;
+    bool isTrackingEnabled = _settings?.isInventoryTrackingEnabled ?? true;
+
+    if (isTrackingEnabled && qty > currentQtyInCart && !id.startsWith('custom_')) {
+      double stock = (data['stockQuantity'] as num? ?? 0.0).toDouble();
+      if (qty > stock) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text("⚠️ الصنف (${data['name']}) مخلص أو الكمية غير كافية في المخزن (المتوفر: $stock)"), backgroundColor: Colors.red, duration: const Duration(seconds: 2))
+        );
+        return;
+      }
+
+      if (data['ingredients'] != null && data['ingredients'] is List) {
+        for (var ing in (data['ingredients'] as List)) {
+          String ingId = ing['id'];
+          double needed = (ing['amount'] as num? ?? 0.0).toDouble() * qty;
+          double available = inventoryNotifier.value[ingId] ?? 0.0;
+          if (needed > available) {
+            ScaffoldMessenger.of(context).showSnackBar(
+              SnackBar(content: Text("⚠️ المكونات غير كافية لتحضير الطلب: ${ing['name']}"), backgroundColor: Colors.orange)
+            );
+            return;
+          }
+        }
+      }
+    }
+
+    final currentCart = Map<String, Map<String, dynamic>>.from(cartNotifier.value);
+    if (qty <= 0) currentCart.remove(id);
+    else {
+      double price = (double.tryParse(data['price'].toString()) ?? 0.0);
+      double taxPercent = (double.tryParse(data['tax']?.toString() ?? "0") ?? 0.0);
+      double extraCosts = (double.tryParse(data['extraCosts']?.toString() ?? "0") ?? 0.0);
+
+      double baseWithExtra = price + extraCosts;
+      double totalWithTax = baseWithExtra * (1 + (taxPercent / 100));
+
+      String time = intl.DateFormat('yyyy/MM/dd hh:mm a').format(DateTime.now());
+
+      currentCart[id] = {
+        ...data,
+        'quantity': qty,
+        'price': price,
+        'tax': taxPercent,
+        'extraCosts': extraCosts,
+        'extraDetails': data['extraDetails'] ?? "",
+        'id': id,
+        'total': totalWithTax * qty,
+        'added_at': currentCart[id]?['added_at'] ?? time,
+      };
+    }
+    cartNotifier.value = currentCart;
+  }
+
+  void _clearAndCloseTable() async {
+    final bool isTakeaway = widget.tableId == "takeaway";
+
+    final bool? confirm = await showDialog<bool>(
+      context: context,
+      builder: (ctx) => Directionality(
+        textDirection: TextDirection.rtl,
+        child: AlertDialog(
+          title: Text(isTakeaway ? "تفريغ السلة" : "تصفير الطاولة"),
+          content: Text(isTakeaway
+              ? "هل أنت متأكد من مسح جميع الأصناف وبيانات الزبون الحالية؟"
+              : "سيتم حذف جميع الطلبات غير المدفوعة وتصفير العداد وإغلاق الطاولة نهائياً. هل أنت متأكد؟"),
+          actions: [
+            TextButton(onPressed: () => Navigator.pop(ctx, false), child: const Text("إلغاء")),
+            TextButton(onPressed: () => Navigator.pop(ctx, true),
+                child: Text(isTakeaway ? "تفريغ" : "تأكيد التصفير", style: const TextStyle(color: Colors.red))),
+          ],
+        ),
       ),
-      child: Stack(
-        children: [
-          Column(
+    );
+
+    if (confirm == true) {
+      if (!mounted) return;
+      if (isTakeaway) {
+        cartNotifier.value = {};
+        _nameController.clear();
+        _phoneController.clear();
+        _barcodeInputController.clear();
+        _receivedAmountController.clear();
+        _selectedCustomerId = null;
+        _selectedCustomerBalance = null;
+        _selectedCustomerLimit = null;
+        ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text("✅ تم تفريغ السلة والبيانات"), backgroundColor: Colors.blue));
+      } else {
+        final String cafeId = _activeCafeId ?? widget.currentUser.cafeId;
+        final String managerId = widget.currentUser.parentId ?? widget.currentUser.id;
+        try {
+          await OrderService.clearTable(
+            tableId: widget.tableId,
+            tableName: widget.tableName,
+            cafeId: cafeId,
+            managerId: managerId, currentUser: widget.currentUser,
+          );
+          if (!mounted) return;
+          cartNotifier.value = {};
+          ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text("✅ تم تصفير الطاولة وإغلاقها"), backgroundColor: Colors.green));
+          Navigator.pop(context);
+        } catch (e) {
+          if (mounted) ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text("❌ خطأ في النظام: $e"), backgroundColor: Colors.red));
+        }
+      }
+    }
+  }
+
+  void _showCustomOrderDialog() {
+    final nameC = TextEditingController();
+    final priceC = TextEditingController();
+
+    showDialog(
+      context: context,
+      builder: (ctx) => Directionality(
+        textDirection: TextDirection.rtl,
+        child: AlertDialog(
+          shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(20)),
+          title: const Row(children: [Icon(Icons.add_shopping_cart, color: Colors.blue), SizedBox(width: 10), Text("طلب يدوي")]),
+          content: Column(
+            mainAxisSize: MainAxisSize.min,
             children: [
-              Expanded(
-                child: ClipRRect(
-                  borderRadius: const BorderRadius.vertical(top: Radius.circular(20)),
-                  child: (imageUrl.isEmpty)
-                      ? Container(color: Colors.grey[200], child: const Center(child: Text("لا توجد صورة", style: TextStyle(fontSize: 10))))
-                      : Image.network(
-                    imageUrl,
-                    fit: BoxFit.cover,
-                    width: double.infinity,
-                    errorBuilder: (context, error, stackTrace) => Container(
-                      color: Colors.red.withOpacity(0.1),
-                      child: const Center(child: Icon(Icons.broken_image, color: Colors.red)),
-                    ),
-                  ),
+              TextField(
+                controller: nameC,
+                autofocus: true,
+                decoration: InputDecoration(
+                  labelText: "التفاصيل (اسم الطلب)",
+                  filled: true,
+                  fillColor: Colors.grey[100],
+                  border: OutlineInputBorder(borderRadius: BorderRadius.circular(15), borderSide: BorderSide.none),
+                  prefixIcon: const Icon(Icons.edit_note),
                 ),
               ),
-              Padding(
-                padding: const EdgeInsets.all(8),
-                child: Column(
-                  children: [
-                    Text(name, style: const TextStyle(fontWeight: FontWeight.bold), maxLines: 1, overflow: TextOverflow.ellipsis),
-                    Text('${widget.currencySymbol}${price.toStringAsFixed(2)}', style: TextStyle(color: primaryColor, fontWeight: FontWeight.bold)),
-                    const SizedBox(height: 5),
-                    Row(
-                      mainAxisAlignment: MainAxisAlignment.spaceEvenly,
-                      children: [
-                        _btn(Icons.remove, () {
-                          if (quantity > 0) {
-                            setState(() => quantity--);
-                            widget.onValueChanged(productId, widget.productData, quantity.toDouble());
-                          }
-                        }),
-                        Text('$quantity', style: const TextStyle(fontWeight: FontWeight.bold)),
-                        _btn(Icons.add, () {
-                          setState(() => quantity++);
-                          widget.onValueChanged(productId, widget.productData, quantity.toDouble());
-                        }),
-                      ],
-                    )
-                  ],
+              const SizedBox(height: 15),
+              TextField(
+                controller: priceC,
+                keyboardType: const TextInputType.numberWithOptions(decimal: true),
+                decoration: InputDecoration(
+                  labelText: "السعر",
+                  suffixText: "₪",
+                  filled: true,
+                  fillColor: Colors.grey[100],
+                  border: OutlineInputBorder(borderRadius: BorderRadius.circular(15), borderSide: BorderSide.none),
+                  prefixIcon: const Icon(Icons.monetization_on_outlined),
                 ),
               ),
             ],
           ),
-          if (canModify) Positioned(top: 5, right: 5, child: Row(children: [
-            _adminBtn(Icons.edit, Colors.blue, widget.onEdit),
-            const SizedBox(width: 4),
-            _adminBtn(Icons.delete, Colors.red, widget.onDelete),
-          ])),
+          actions: [
+            TextButton(onPressed: () => Navigator.pop(ctx), child: const Text("إلغاء")),
+            ElevatedButton(
+              style: ElevatedButton.styleFrom(
+                backgroundColor: Colors.blue[900],
+                foregroundColor: Colors.white,
+                padding: const EdgeInsets.symmetric(horizontal: 20, vertical: 12),
+                shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
+              ),
+              onPressed: () {
+                final name = nameC.text.trim();
+                final price = double.tryParse(priceC.text.trim()) ?? 0.0;
+                if (name.isNotEmpty && price > 0) {
+                  final String customId = "custom_${DateTime.now().millisecondsSinceEpoch}";
+                  _updateCart(customId, {
+                    'name': name,
+                    'price': price,
+                    'category': 'يدوي',
+                    'image': '',
+                  }, 1);
+                  Navigator.pop(ctx);
+                }
+              },
+              child: const Text("إضافة للسلة", style: TextStyle(fontWeight: FontWeight.bold)),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  void _showMergeDialog() {
+    final busyTables = _allTables.where((t) => t['is_open'] == true && t['id'] != widget.tableId).toList();
+
+    if (busyTables.isEmpty) {
+      ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text("لا توجد طاولات أخرى مشغولة لدمجها")));
+      return;
+    }
+
+    showDialog(
+      context: context,
+      builder: (ctx) => Directionality(
+        textDirection: TextDirection.rtl,
+        child: AlertDialog(
+          shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(20)),
+          title: const Row(children: [Icon(Icons.merge_type, color: Colors.blueGrey), SizedBox(width: 8), Text("دمج حساب طاولة أخرى")]),
+          content: SizedBox(
+            width: double.maxFinite,
+            child: ListView.builder(
+              shrinkWrap: true,
+              itemCount: busyTables.length,
+              itemBuilder: (context, index) {
+                final table = busyTables[index];
+                return ListTile(
+                  leading: const Icon(Icons.table_bar, color: Colors.orange),
+                  title: Text(table['name'], style: const TextStyle(fontWeight: FontWeight.bold)),
+                  subtitle: const Text("سحب جميع الطلبات إلى هذه الفاتورة", style: TextStyle(fontSize: 11)),
+                  onTap: () async {
+                    Navigator.pop(ctx);
+                    _confirmMerge(table['id'], table['name']);
+                  },
+                );
+              },
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+
+  void _confirmMerge(String sourceId, String sourceName) async {
+    final bool? confirm = await showDialog<bool>(
+      context: context,
+      builder: (ctx) => Directionality(
+        textDirection: TextDirection.rtl,
+        child: AlertDialog(
+          title: const Text("تأكيد الدمج"),
+          content: Text("هل أنت متأكد من نقل حساب ($sourceName) إلى (${widget.tableName})؟ سيتم إغلاق طاولة $sourceName."),
+          actions: [
+            TextButton(onPressed: () => Navigator.pop(ctx, false), child: const Text("إلغاء")),
+            TextButton(onPressed: () => Navigator.pop(ctx, true), child: const Text("تأكيد النقل", style: TextStyle(color: Colors.orange, fontWeight: FontWeight.bold))),
+          ],
+        ),
+      ),
+    );
+
+    if (confirm == true) {
+      try {
+        await OrderService.mergeTables(
+          sourceTableId: sourceId,
+          sourceTableName: sourceName,
+          targetTableId: widget.tableId,
+          targetTableName: widget.tableName,
+          cafeId: _activeCafeId ?? widget.currentUser.cafeId,
+          currentUser: widget.currentUser,
+        );
+        if (mounted) {
+           ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text("✅ تم دمج الطاولات بنجاح"), backgroundColor: Colors.green));
+        }
+      } catch (e) {
+        if (mounted) ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text("❌ خطأ: $e")));
+      }
+    }
+  }
+
+  void _showTransferSingleItemDialog(Map<String, dynamic> item) {
+    String? selectedTargetTable;
+    double qtyToMove = (item['quantity'] as num).toDouble();
+    double maxQty = qtyToMove;
+
+    showDialog(
+      context: context,
+      builder: (ctx) => StatefulBuilder(
+        builder: (context, setDialogState) => Directionality(
+          textDirection: TextDirection.rtl,
+          child: AlertDialog(
+            title: const Text("نقل الصنف لطاولة أخرى"),
+            content: Column(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                Text("الصنف: ${item['name']}"),
+                const SizedBox(height: 15),
+                StreamBuilder<QuerySnapshot>(
+                  stream: FirebaseFirestore.instance.collection('tables')
+                      .where('cafe_id', isEqualTo: _activeCafeId)
+                      .snapshots(),
+                  builder: (context, snap) {
+                    if (!snap.hasData) return const CircularProgressIndicator();
+                    final tables = snap.data!.docs.where((d) {
+                       final data = d.data() as Map;
+                       return data['name'] != widget.tableName;
+                    }).toList();
+                    
+                    if (tables.isEmpty) return const Text("لا توجد طاولات أخرى متاحة");
+
+                    return DropdownButtonFormField<String>(
+                      isExpanded: true,
+                      decoration: AppComponents.fieldInput("اختر الطاولة الهدف", Icons.table_restaurant),
+                      items: tables.map((t) {
+                        final name = (t.data() as Map)['name'].toString();
+                        return DropdownMenuItem(value: name, child: Text(name));
+                      }).toList(),
+                      onChanged: (v) => setDialogState(() => selectedTargetTable = v),
+                    );
+                  },
+                ),
+                const SizedBox(height: 20),
+                Row(
+                  mainAxisAlignment: MainAxisAlignment.center,
+                  children: [
+                    IconButton(icon: const Icon(Icons.remove_circle_outline), onPressed: qtyToMove > 1 ? () => setDialogState(() => qtyToMove -= 1) : null),
+                    Text(qtyToMove.toStringAsFixed(0), style: const TextStyle(fontSize: 18, fontWeight: FontWeight.bold)),
+                    IconButton(icon: const Icon(Icons.add_circle_outline), onPressed: qtyToMove < maxQty ? () => setDialogState(() => qtyToMove += 1) : null),
+                  ],
+                ),
+                Text("من أصل $maxQty", style: const TextStyle(fontSize: 12, color: Colors.grey)),
+              ],
+            ),
+            actions: [
+              TextButton(onPressed: () => Navigator.pop(ctx), child: const Text("إلغاء")),
+              ElevatedButton(
+                onPressed: (selectedTargetTable != null) ? () async {
+                  try {
+                    Navigator.pop(ctx);
+                    final List<Map<String, dynamic>> itemsToMove = [
+                      {
+                        ...item,
+                        'quantity': qtyToMove,
+                        'total': qtyToMove * (item['price'] as num).toDouble(),
+                      }
+                    ];
+                    await OrderService.transferItems(
+                      sourceOrderId: item['orderId'],
+                      targetTableName: selectedTargetTable!,
+                      itemsToTransfer: itemsToMove,
+                      currentUser: widget.currentUser,
+                    );
+                    ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text("✅ تم نقل الصنف بنجاح"), backgroundColor: Colors.green));
+                  } catch (e) {
+                    ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text("❌ خطأ: $e"), backgroundColor: Colors.red));
+                  }
+                } : null,
+                child: const Text("تأكيد النقل"),
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+
+  @override
+  void dispose() {
+    _debounce?.cancel();
+    _timerTick?.cancel();
+    _searchController.dispose();
+    _nameController.dispose();
+    _phoneController.dispose();
+    _receivedAmountController.dispose();
+    _barcodeInputController.dispose();
+    _barcodeFieldFocusNode.dispose();
+    _settingsSub?.cancel();
+    _inventorySub?.cancel();
+    _debtSub?.cancel();
+    _tablesSub?.cancel();
+    _productsSub?.cancel();
+    _tableSub?.cancel();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    if (!widget.currentUser.canRead('orders')) {
+      return const Scaffold(body: Center(child: Text("عذراً، لا تملك صلاحية الوصول لصفحة الطلبات", style: TextStyle(fontWeight: FontWeight.bold))));
+    }
+    final theme = Theme.of(context);
+
+    return LayoutBuilder(
+      builder: (context, constraints) {
+        final bool isWide = constraints.maxWidth > 800;
+
+        return Scaffold(
+          backgroundColor: const Color(0xFFF0F2F5),
+          body: Row(children: [
+            Expanded(
+              flex: 3,
+              child: Column(children: [
+                _buildDashboardHeader(theme),
+                _buildSearchBox_withBarcode(),
+                Expanded(child: _buildProductSection()),
+              ]),
+            ),
+            if (isWide)
+              Container(
+                width: 360,
+                decoration: const BoxDecoration(
+                  color: Colors.white,
+                  border: Border(right: BorderSide(color: Colors.black12)),
+                ),
+                child: _buildInvoiceSide(),
+              ),
+          ]),
+          floatingActionButton: (!isWide && (widget.currentUser.canPayOrders || widget.currentUser.canMakeOrders)) ? ValueListenableBuilder<Map<String, Map<String, dynamic>>>(
+            valueListenable: cartNotifier,
+            builder: (context, cart, _) {
+              if (cart.isEmpty && widget.tableId == "takeaway") return const SizedBox.shrink();
+              return FloatingActionButton.extended(
+                onPressed: () => _showMobileInvoice(),
+                label: Text("الفاتورة (${cart.length})"),
+                icon: const Icon(Icons.shopping_basket),
+                backgroundColor: Colors.blue[900],
+              );
+            },
+          ) : null,
+        );
+      }
+    );
+  }
+
+  Widget _buildDashboardHeader(ThemeData theme) {
+    final double topPad = MediaQuery.of(context).padding.top;
+
+    return Container(
+      padding: EdgeInsets.fromLTRB(16, topPad > 10 ? topPad + 5 : 25, 16, 20),
+      decoration: BoxDecoration(
+        gradient: LinearGradient(colors: [theme.primaryColor, theme.primaryColor.withBlue(200)]),
+        borderRadius: const BorderRadius.only(bottomLeft: Radius.circular(30), bottomRight: Radius.circular(30)),
+        boxShadow: [BoxShadow(color: theme.primaryColor.withOpacity(0.3), blurRadius: 10, offset: const Offset(0, 5))]
+      ),
+      child: Column(
+        children: [
+          Row(children: [
+            IconButton(icon: const Icon(Icons.arrow_back_ios, color: Colors.white, size: 20), onPressed: () => Navigator.pop(context)),
+            Text(widget.tableName, style: const TextStyle(color: Colors.white, fontSize: 18, fontWeight: FontWeight.bold)),
+            const Spacer(),
+            IconButton(
+              icon: const Icon(Icons.qr_code_scanner, color: Colors.white, size: 28),
+              onPressed: () {
+                _barcodeFieldFocusNode.requestFocus();
+                ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text("جهاز المسح جاهز..."), duration: Duration(milliseconds: 700)));
+              },
+              tooltip: "تفعيل الماسح"
+            ),
+            if (widget.currentUser.canDeleteOrders)
+              IconButton(
+                icon: const Icon(Icons.delete_sweep, color: Colors.white),
+                onPressed: _clearAndCloseTable,
+                tooltip: "تفريغ الفاتورة"
+              ),
+          ]),
+          const SizedBox(height: 15),
+          Row(mainAxisAlignment: MainAxisAlignment.spaceAround, children: [
+            ValueListenableBuilder<Map<String, Map<String, dynamic>>>(
+              valueListenable: cartNotifier,
+              builder: (context, cart, _) => _dashboardStat("الأصناف", "${cart.length}", Icons.shopping_cart, Colors.greenAccent),
+            ),
+            ValueListenableBuilder<Map<String, Map<String, dynamic>>>(
+              valueListenable: cartNotifier,
+              builder: (context, cart, _) {
+                double total = cart.values.fold(0.0, (acc, item) => acc + (item['total'] ?? 0));
+                if (widget.tableId != "takeaway") {
+                  total += _currentTimerPrice;
+                }
+                return _dashboardStat("إجمالي الحساب", "${total.round()}", Icons.payments, Colors.orangeAccent);
+              }
+            ),
+          ]),
         ],
       ),
     );
   }
 
-  Widget _adminBtn(IconData icon, Color color, VoidCallback onTap) => InkWell(
-      onTap: onTap,
-      child: CircleAvatar(radius: 14, backgroundColor: Colors.white.withOpacity(0.9), child: Icon(icon, size: 14, color: color))
-  );
+  Widget _dashboardStat(String label, String value, IconData icon, Color col) {
+    return Column(children: [
+      Row(children: [Icon(icon, color: col, size: 14), const SizedBox(width: 4), Text(label, style: const TextStyle(color: Colors.white70, fontSize: 11))]),
+      const SizedBox(height: 4),
+      Text(value, style: const TextStyle(color: Colors.white, fontSize: 16, fontWeight: FontWeight.bold)),
+    ]);
+  }
 
-  Widget _btn(IconData icon, VoidCallback onTap) => InkWell(
-      onTap: onTap,
-      child: Container(
-          padding: const EdgeInsets.all(4),
-          decoration: BoxDecoration(color: widget.theme.colorScheme.primary, borderRadius: BorderRadius.circular(8)),
-          child: Icon(icon, size: 18, color: Colors.white)
-      )
-  );
+  Widget _buildSearchBox_withBarcode() {
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 10),
+      color: Colors.white,
+      child: Row(
+        children: [
+          Expanded(
+            flex: 2,
+            child: TextField(
+              controller: _searchController,
+              decoration: InputDecoration(
+                hintText: "بحث بالاسم...",
+                prefixIcon: const Icon(Icons.search),
+                filled: true,
+                fillColor: Colors.grey[100],
+                border: OutlineInputBorder(borderRadius: BorderRadius.circular(12), borderSide: BorderSide.none),
+                contentPadding: const EdgeInsets.symmetric(vertical: 0),
+              ),
+            ),
+          ),
+          const SizedBox(width: 10),
+          Expanded(
+            flex: 1,
+            child: TextField(
+              controller: _barcodeInputController,
+              focusNode: _barcodeFieldFocusNode,
+              onSubmitted: _onBarcodeScanned,
+              decoration: InputDecoration(
+                hintText: "الباركود...",
+                prefixIcon: const Icon(Icons.barcode_reader),
+                filled: true,
+                fillColor: Colors.blue[50],
+                border: OutlineInputBorder(borderRadius: BorderRadius.circular(12), borderSide: BorderSide(color: Colors.blue.withOpacity(0.2))),
+                contentPadding: const EdgeInsets.symmetric(vertical: 0),
+              ),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildProductSection() {
+    final String cafeId = _activeCafeId ?? widget.currentUser.cafeId;
+    final String managerId = widget.currentUser.parentId ?? widget.currentUser.id;
+    return StreamBuilder<QuerySnapshot>(
+        stream: FirebaseFirestore.instance.collection('products').where('cafeId', isEqualTo: cafeId).where('parentId', isEqualTo: managerId).snapshots(),
+        builder: (context, snapshot) {
+          if (!snapshot.hasData) return const Center(child: CircularProgressIndicator());
+          final allDocs = snapshot.data!.docs;
+          final categories = ["الكل", ...allDocs.map((d) => (d.data() as Map)['category']?.toString() ?? "عام").toSet().toList()..sort()];
+
+          if (_tabController == null || _tabController!.length != categories.length) {
+            _tabController = TabController(length: categories.length, vsync: this);
+          }
+
+          return Column(children: [
+            TabBar(
+              controller: _tabController,
+              isScrollable: true,
+              labelColor: Colors.blue[900],
+              unselectedLabelColor: Colors.grey,
+              indicatorColor: Colors.blue[900],
+              tabs: categories.map((cat) => Tab(text: cat)).toList(),
+            ),
+            Expanded(child: TabBarView(
+              controller: _tabController,
+              children: categories.map<Widget>((cat) => CategoryGridView(
+                category: cat,
+                allDocs: allDocs,
+                searchNotifier: searchNotifier,
+                cartNotifier: cartNotifier,
+                inventoryNotifier: inventoryNotifier,
+                onProductTap: (id, data, q) => _updateCart(id, data, q),
+                onProductLongPress: (id, data) {
+                  if (widget.currentUser.canEditMenu) {
+                    Navigator.push(context, MaterialPageRoute(builder: (_) => AddProduct(currentUser: widget.currentUser, productToEdit: {'id': id, ...data})));
+                  }
+                },
+              )).toList(),
+            ))
+          ]);
+        }
+    );
+  }
+
+  Widget _buildInvoiceSide() {
+    return StreamBuilder<QuerySnapshot>(
+      stream: _pendingOrdersStream,
+      builder: (context, snapshot) {
+        List<Map<String, dynamic>> previousItems = [];
+        double previousTotal = 0;
+
+        if (snapshot.hasData) {
+          final docs = snapshot.data!.docs.toList();
+          docs.sort((a, b) {
+            final t1 = (a.data() as Map<String, dynamic>)['ordered_at'] as Timestamp?;
+            final t2 = (b.data() as Map<String, dynamic>)['ordered_at'] as Timestamp?;
+            if (t1 == null) return 1;
+            if (t2 == null) return -1;
+            return t1.compareTo(t2);
+          });
+
+          for (var doc in docs) {
+            var data = doc.data() as Map<String, dynamic>;
+            var items = data['items'] as List? ?? [];
+            for (var it in items) {
+              final itemMap = Map<String, dynamic>.from(it);
+              itemMap['orderId'] = doc.id;
+              previousItems.add(itemMap);
+            }
+            previousTotal += (data['total'] as num? ?? 0).toDouble();
+          }
+        }
+
+        return Column(children: [
+          Padding(
+            padding: const EdgeInsets.all(16),
+            child: Row(
+              children: [
+                const Icon(Icons.receipt_long, color: Colors.blue),
+                const SizedBox(width: 8),
+                const Text("تفاصيل الفاتورة", style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold)),
+                const Spacer(),
+                if (widget.currentUser.canMakeOrders && widget.tableId != "takeaway")
+                   IconButton(
+                    icon: const Icon(Icons.merge_type, color: Colors.blueGrey),
+                    onPressed: _showMergeDialog,
+                    tooltip: "دمج حساب طاولة أخرى",
+                  ),
+                if (widget.currentUser.canMakeOrders)
+                  TextButton.icon(
+                    onPressed: _showCustomOrderDialog,
+                    icon: const Icon(Icons.add, size: 18),
+                    label: const Text("يدوي", style: TextStyle(fontWeight: FontWeight.bold)),
+                    style: TextButton.styleFrom(foregroundColor: Colors.blue[900]),
+                  )
+              ],
+            ),
+          ),
+          const Divider(height: 1),
+          Expanded(child: ListView(
+            children: [
+              if (_currentTimerPrice > 0.01) ...[
+                ListTile(
+                  dense: true,
+                  leading: const Icon(Icons.timer_outlined, color: Colors.orange, size: 20),
+                  title: const Text("رسوم الوقت / الشحن", style: TextStyle(fontWeight: FontWeight.bold, color: Colors.orange)),
+                  trailing: Text("${_currentTimerPrice.round()} ₪", style: const TextStyle(color: Colors.orange, fontWeight: FontWeight.bold)),
+                ),
+                const Divider(),
+              ],
+
+              if (previousItems.isNotEmpty) ...[
+                const Padding(
+                  padding: EdgeInsets.symmetric(horizontal: 16, vertical: 8),
+                  child: Row(
+                    children: [
+                      Icon(Icons.history, size: 16, color: Colors.grey),
+                      SizedBox(width: 5),
+                      Text("طلبات سابقة (موجودة)", style: TextStyle(color: Colors.grey, fontWeight: FontWeight.bold, fontSize: 13)),
+                    ],
+                  ),
+                ),
+                ...previousItems.map((item) => ListTile(
+                  dense: true,
+                  title: Text(item['name'], style: const TextStyle(color: Colors.black54)),
+                  subtitle: Text("${item['price']} ₪ x ${item['quantity']} | ${item['added_at'] ?? ''}", style: const TextStyle(fontSize: 11)),
+                  trailing: Row(
+                    mainAxisSize: MainAxisSize.min,
+                    children: [
+                      Text("${(item['total'] ?? 0).round()} ₪", style: const TextStyle(color: Colors.grey, fontWeight: FontWeight.bold)),
+                      if (item['orderId'] != null)
+                        IconButton(
+                          icon: const Icon(Icons.move_up_rounded, color: Colors.blue, size: 18),
+                          onPressed: () => _showTransferSingleItemDialog(item),
+                          tooltip: "نقل هذا الصنف",
+                        ),
+                    ],
+                  ),
+                )),
+                const Divider(),
+              ],
+
+              ValueListenableBuilder<Map<String, Map<String, dynamic>>>(
+                valueListenable: cartNotifier,
+                builder: (context, cart, _) {
+                  if (cart.isEmpty && previousItems.isEmpty && _currentTimerPrice < 0.01) return const Center(child: Padding(padding: EdgeInsets.all(40), child: Text("السلة فارغة", style: TextStyle(color: Colors.grey))));
+
+                  return Column(
+                    children: cart.entries.map((entry) {
+                      final item = entry.value;
+                      final id = entry.key;
+                      return ListTile(
+                        dense: true,
+                        title: Text(item['name'], style: const TextStyle(fontWeight: FontWeight.bold)),
+                        subtitle: Column(
+                          crossAxisAlignment: CrossAxisAlignment.start,
+                          children: [
+                            Row(
+                              children: [
+                                Text("${item['price']} ₪ x ${item['quantity']}"),
+                                if ((item['tax'] ?? 0) > 0 || (item['extraCosts'] ?? 0) > 0) ...[
+                                  const SizedBox(width: 5),
+                                  GestureDetector(
+                                    onTap: () {
+                                      AppComponents.showAppDialog(
+                                        context: context,
+                                        title: "تفاصيل التكاليف لـ ${item['name']}",
+                                        content: Column(
+                                          mainAxisSize: MainAxisSize.min,
+                                          crossAxisAlignment: CrossAxisAlignment.start,
+                                          children: [
+                                            Text("السعر الأساسي: ${item['price']} ₪"),
+                                            if ((item['tax'] ?? 0) > 0) Text("الضريبة: ${item['tax']}%"),
+                                            if ((item['extraCosts'] ?? 0) > 0) Text("تكاليف إضافية: ${item['extraCosts']} ₪"),
+                                            if (item['extraDetails'] != null && item['extraDetails'].toString().isNotEmpty)
+                                              Padding(
+                                                padding: const EdgeInsets.only(top: 8.0),
+                                                child: Text("ملاحظات: ${item['extraDetails']}", style: TextStyle(fontSize: 12, color: Colors.grey[600])),
+                                              ),
+                                          ],
+                                        ),
+                                        actions: [TextButton(onPressed: () => Navigator.pop(context), child: const Text("إغلاق"))]
+                                      );
+                                    },
+                                    child: const Icon(Icons.info_outline, size: 14, color: Colors.orange),
+                                  ),
+                                ]
+                              ],
+                            ),
+                            if (item['added_at'] != null)
+                              Text(item['added_at'], style: const TextStyle(fontSize: 10, color: Colors.grey)),
+                          ],
+                        ),
+                        trailing: Row(mainAxisSize: MainAxisSize.min, children: [
+                          Text("${item['total'].round()} ₪", style: const TextStyle(color: Colors.blue, fontWeight: FontWeight.bold)),
+                          const SizedBox(width: 4),
+                          IconButton(icon: const Icon(Icons.add_circle_outline, color: Colors.green, size: 20), onPressed: () => _updateCart(id, item, item['quantity'] + 1)),
+                          IconButton(icon: const Icon(Icons.remove_circle_outline, color: Colors.red, size: 20), onPressed: () => _updateCart(id, item, item['quantity'] - 1)),
+                        ]),
+                      );
+                    }).toList(),
+                  );
+                },
+              ),
+            ],
+          )),
+          _buildCheckoutSection(previousTotal),
+        ]);
+      }
+    );
+  }
+
+  Widget _buildCheckoutSection(double previousTotal) {
+    return ValueListenableBuilder<Map<String, Map<String, dynamic>>>(
+        valueListenable: cartNotifier,
+        builder: (context, cart, _) {
+          double subTotal = cart.values.fold(0.0, (acc, item) => acc + (item['total'] ?? 0));
+          double grandTotal = subTotal + previousTotal + _currentTimerPrice;
+          final bool isTakeaway = widget.tableId == "takeaway";
+
+          final bool canShowPayment = widget.currentUser.canPayOrders && (
+            widget.currentUser.role == UserRole.super_admin || 
+            widget.currentUser.role == UserRole.admin || 
+            widget.currentUser.role == UserRole.manager || 
+            widget.currentUser.role == UserRole.cashier ||
+            widget.currentUser.role == UserRole.custom
+          );
+
+          return Container(
+            padding: const EdgeInsets.all(16),
+            decoration: BoxDecoration(color: Colors.white, boxShadow: [BoxShadow(color: Colors.black.withOpacity(0.05), blurRadius: 10, offset: const Offset(0, -5))]),
+            child: Column(mainAxisSize: MainAxisSize.min, children: [
+              Row(mainAxisAlignment: MainAxisAlignment.spaceBetween, children: [const Text("إجمالي الحساب:", style: TextStyle(fontSize: 16)), Text("${grandTotal.round()} ₪", style: TextStyle(fontSize: 22, fontWeight: FontWeight.bold, color: Colors.blue[900]))]),
+              const SizedBox(height: 16),
+              if (!isTakeaway && widget.currentUser.canMakeOrders) ...[
+                ElevatedButton.icon(
+                  style: ElevatedButton.styleFrom(
+                    backgroundColor: Colors.blue[800],
+                    foregroundColor: Colors.white,
+                    minimumSize: const Size(double.infinity, 50),
+                    shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12))
+                  ),
+                  onPressed: cart.isEmpty ? null : () => _submitOrder("pending", subTotal),
+                  icon: const Icon(Icons.table_bar),
+                  label: const Text("إضافة للطاولة / إرسال", style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold)),
+                ),
+                const SizedBox(height: 10),
+              ],
+              if (canShowPayment)
+                ElevatedButton.icon(
+                  style: ElevatedButton.styleFrom(
+                    backgroundColor: Colors.green[700],
+                    foregroundColor: Colors.white,
+                    minimumSize: const Size(double.infinity, 50),
+                    shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12))
+                  ),
+                  onPressed: (cart.isEmpty && previousTotal == 0 && _currentTimerPrice == 0) ? null : () => _showPaymentDialog(grandTotal),
+                  icon: const Icon(Icons.check_circle),
+                  label: Text(isTakeaway ? "إتمام ودفع" : "دفع وإغلاق الطاولة", style: const TextStyle(fontSize: 18, fontWeight: FontWeight.bold)),
+                )
+            ]),
+          );
+        }
+    );
+  }
+
+  void _showMobileInvoice() {
+    showModalBottomSheet(context: context, isScrollControlled: true, shape: const RoundedRectangleBorder(borderRadius: BorderRadius.vertical(top: Radius.circular(20))), builder: (_) => Container(height: MediaQuery.of(context).size.height * 0.8, child: _buildInvoiceSide()));
+  }
+
+  void _showPaymentDialog(double total) {
+    List<Map<String, dynamic>> payers = [
+      {
+        'nameController': TextEditingController(text: _nameController.text),
+        'phoneController': TextEditingController(text: _phoneController.text),
+        'amountController': TextEditingController(text: total.round().toString()),
+        'method': "كاش",
+        'id': _selectedCustomerId,
+        'balance': _selectedCustomerBalance,
+        'limit': _selectedCustomerLimit,
+      }
+    ];
+
+    showModalBottomSheet(
+      context: context,
+      isScrollControlled: true,
+      backgroundColor: Colors.transparent,
+      builder: (ctx) => StatefulBuilder(
+        builder: (contextDialog, setDialogState) {
+          double totalReceived = 0;
+          for (var p in payers) {
+            totalReceived += double.tryParse(p['amountController'].text.trim()) ?? 0.0;
+          }
+
+          double balance = totalReceived - total;
+          double remaining = total - totalReceived;
+
+          return Directionality(
+            textDirection: TextDirection.rtl,
+            child: Container(
+              decoration: const BoxDecoration(color: Colors.white, borderRadius: BorderRadius.vertical(top: Radius.circular(20))),
+              padding: EdgeInsets.fromLTRB(20, 20, 20, MediaQuery.of(ctx).viewInsets.bottom + 20),
+              child: SingleChildScrollView(
+                child: Column(mainAxisSize: MainAxisSize.min, children: [
+                  const Text("إتمام الدفع (تقسيم على أشخاص)", style: TextStyle(fontSize: 20, fontWeight: FontWeight.bold)),
+                  const SizedBox(height: 15),
+
+                  ...payers.asMap().entries.map((entry) {
+                    int idx = entry.key;
+                    var p = entry.value;
+                    return _buildPayerInputBlock(idx, p, remaining, setDialogState, contextDialog);
+                  }),
+
+                  const SizedBox(height: 10),
+
+                  ElevatedButton.icon(
+                    onPressed: () {
+                      setDialogState(() {
+                        payers.add({
+                          'nameController': TextEditingController(),
+                          'phoneController': TextEditingController(),
+                          'amountController': TextEditingController(text: remaining > 0 ? remaining.round().toString() : "0"),
+                          'method': "كاش",
+                          'id': null,
+                          'balance': null,
+                          'limit': null,
+                        });
+                      });
+                    },
+                    icon: const Icon(Icons.person_add_alt_1),
+                    label: const Text("إضافة شخص آخر للدفع"),
+                    style: ElevatedButton.styleFrom(
+                      backgroundColor: Colors.blue[50],
+                      foregroundColor: Colors.blue[900],
+                      elevation: 0,
+                      minimumSize: const Size(double.infinity, 45),
+                      shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12))
+                    ),
+                  ),
+
+                  const Divider(height: 30),
+
+                  Container(
+                    padding: const EdgeInsets.all(12),
+                    decoration: BoxDecoration(
+                      color: balance >= 0 ? Colors.green[50] : Colors.red[50],
+                      borderRadius: BorderRadius.circular(12),
+                      border: Border.all(color: balance >= 0 ? Colors.green[100]! : Colors.red[100]!)
+                    ),
+                    child: Row(
+                      mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                      children: [
+                        Text(balance >= 0 ? "يتبقى له (رصيد):" : "يتبقى عليه (دين):", style: TextStyle(fontWeight: FontWeight.bold, color: balance >= 0 ? Colors.green[800] : Colors.red[800])),
+                        Text("${balance.abs().round()} ₪", style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold, color: balance >= 0 ? Colors.green[800] : Colors.red[800])),
+                      ],
+                    ),
+                  ),
+
+                  const SizedBox(height: 20),
+
+                  ElevatedButton.icon(
+                    style: ElevatedButton.styleFrom(
+                      backgroundColor: Colors.green[700],
+                      foregroundColor: Colors.white,
+                      minimumSize: const Size(double.infinity, 55),
+                      shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(15))
+                    ),
+                    onPressed: () => _handleMultiPayerSubmission(context, total, totalReceived, payers, ctx),
+                    icon: const Icon(Icons.check_circle),
+                    label: const Text("تأكيد العملية وتسجيل الحوالات", style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold)),
+                  ),
+
+                  const SizedBox(height: 10),
+                  TextButton(
+                    onPressed: () => Navigator.pop(ctx),
+                    child: const Text("إلغاء", style: TextStyle(color: Colors.grey)),
+                  ),
+                ]),
+              ),
+            ),
+          );
+        }
+      ),
+    );
+  }
+
+  Widget _buildPayerInputBlock(int index, Map<String, dynamic> p, double remaining, StateSetter setDialogState, BuildContext ctx) {
+    return Container(
+      margin: const EdgeInsets.only(bottom: 12),
+      padding: const EdgeInsets.all(12),
+      decoration: BoxDecoration(
+        color: index == 0 ? Colors.blue.withOpacity(0.03) : Colors.grey[50],
+        borderRadius: BorderRadius.circular(15),
+        border: Border.all(color: index == 0 ? Colors.blue[100]! : Colors.grey[200]!)
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Border_Wrapper(index),
+          const SizedBox(height: 8),
+          Autocomplete<Map<String, String>>(
+            displayStringForOption: (option) => option['name']!,
+            optionsBuilder: (textEditingValue) {
+              if (textEditingValue.text.isEmpty) return const Iterable.empty();
+              final q = textEditingValue.text.toLowerCase();
+              return _customerSuggestions.where((c) => c['name']!.toLowerCase().contains(q) || c['phone']!.contains(q));
+            },
+            onSelected: (selection) {
+              setDialogState(() {
+                p['nameController'].text = selection['name']!;
+                p['phoneController'].text = selection['phone'] ?? "";
+                p['id'] = selection['id'];
+                p['balance'] = selection['debt'];
+                p['limit'] = double.tryParse(selection['limit'] ?? "0") ?? 0;
+              });
+            },
+            fieldViewBuilder: (context, controller, focusNode, onFieldSubmitted) {
+              if (controller.text.isEmpty && p['nameController'].text.isNotEmpty) {
+                controller.text = p['nameController'].text;
+              }
+              return TextField(
+                controller: controller,
+                focusNode: focusNode,
+                onChanged: (v) => setDialogState(() {
+                  p['nameController'].text = v;
+                  p['id'] = null;
+                }),
+                decoration: AppComponents.fieldInput("اسم الزبون...", Icons.person_outline),
+              );
+            },
+          ),
+          const SizedBox(height: 8),
+          TextField(
+            controller: p['phoneController'],
+            keyboardType: TextInputType.phone,
+            decoration: AppComponents.fieldInput("رقم الهاتف", Icons.phone_android_outlined),
+          ),
+          if (p['balance'] != null)
+            Padding(
+              padding: const EdgeInsets.only(top: 5, right: 10),
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Row(
+                    children: [
+                      Text("الرصيد الحالي: ${p['balance']} ₪ ${p['limit'] != null && p['limit'] > 0 ? '(الحد: ${p['limit']})' : ''}",
+                        style: TextStyle(
+                          fontSize: 11,
+                          fontWeight: FontWeight.bold,
+                          color: (double.tryParse(p['balance']?.toString() ?? "0") ?? 0) > 0 ? Colors.red[800] : Colors.blueGrey
+                        )),
+                      const SizedBox(width: 8),
+                      if ((double.tryParse(p['balance']?.toString() ?? "0") ?? 0) > 0)
+                        TextButton.icon(
+                          onPressed: () {
+                            setDialogState(() {
+                              double currentDebt = double.tryParse(p['balance'].toString()) ?? 0.0;
+                              double currentAmt = double.tryParse(p['amountController'].text.trim()) ?? 0.0;
+                              p['amountController'].text = (currentAmt + currentDebt).round().toString();
+                            });
+                          },
+                          style: TextButton.styleFrom(padding: EdgeInsets.zero, minimumSize: Size.zero, tapTargetSize: MaterialTapTargetSize.shrinkWrap),
+                          icon: const Icon(Icons.add_circle_outline, size: 14),
+                          label: const Text("دفع مع الدين السابق", style: TextStyle(fontSize: 10, fontWeight: FontWeight.bold)),
+                        ),
+                    ],
+                  ),
+                ],
+              ),
+            ),
+          const SizedBox(height: 10),
+          Row(
+            children: [
+              Expanded(
+                flex: 2,
+                child: TextField(
+                  controller: p['amountController'],
+                  keyboardType: TextInputType.number,
+                  onChanged: (v) => setDialogState(() {}),
+                  decoration: AppComponents.fieldInput("المبلغ", Icons.payments_outlined),
+                ),
+              ),
+              const SizedBox(width: 8),
+              ElevatedButton(
+                style: ElevatedButton.styleFrom(backgroundColor: Colors.blue[900], foregroundColor: Colors.white),
+                onPressed: () {
+                  double currentVal = double.tryParse(p['amountController'].text.trim()) ?? 0.0;
+                  double needed = remaining + currentVal;
+                  p['amountController'].text = needed > 0 ? needed.round().toString() : "0";
+                  setDialogState(() {});
+                },
+                child: const Text("باقي"),
+              ),
+            ],
+          ),
+          const SizedBox(height: 10),
+          SingleChildScrollView(
+            scrollDirection: Axis.horizontal,
+            child: Row(
+              children: _paymentMethods.where((m) => m != "دين" || widget.currentUser.canManageDebts).map((m) {
+                bool isSelected = p['method'] == m;
+                return Padding(
+                  padding: const EdgeInsets.only(left: 8),
+                  child: ChoiceChip(
+                    label: Text(m, style: TextStyle(color: isSelected ? Colors.white : Colors.black, fontSize: 12)),
+                    selected: isSelected,
+                    selectedColor: m == "دين" ? Colors.orange[900] : Colors.blue[900],
+                    onSelected: (v) => setDialogState(() => p['method'] = m),
+                  ),
+                );
+              }).toList(),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget Border_Wrapper(int index) {
+    return Row(
+      mainAxisAlignment: MainAxisAlignment.spaceBetween,
+      children: [
+        Text(index == 0 ? "المسدد الأساسي" : "مشارك دفع #${index + 1}",
+          style: TextStyle(fontWeight: FontWeight.bold, color: index == 0 ? Colors.blue[900] : Colors.black87)),
+      ],
+    );
+  }
+
+  Future<void> _handleMultiPayerSubmission(BuildContext context, double total, double totalReceived, List<Map<String, dynamic>> payers, BuildContext ctx) async {
+    for (var p in payers) {
+      if (p['method'] == "دين" && p['limit'] != null && p['limit'] > 0) {
+        double amt = double.tryParse(p['amountController'].text.trim()) ?? 0;
+        double cur = double.tryParse(p['balance']?.toString() ?? "0") ?? 0;
+        if ((cur + amt) > p['limit']) {
+          bool? allow = await showDialog<bool>(
+            context: context,
+            builder: (c) => Directionality(
+              textDirection: TextDirection.rtl,
+              child: AlertDialog(
+                title: const Text("⚠️ تجاوز الحد الائتماني"),
+                content: Text("الحساب (${p['nameController'].text}) سيتجاوز الحد المسموح به (${p['limit']} ₪).\nالمديونية الإجمالية ستصبح: ${(cur + amt).round()} ₪.\nهل تريد المتابعة؟"),
+                actions: [
+                  TextButton(onPressed: () => Navigator.pop(c, false), child: const Text("إلغاء")),
+                  TextButton(onPressed: () => Navigator.pop(c, true), child: const Text("نعم، متابعة")),
+                ],
+              ),
+            ),
+          );
+          if (allow != true) return;
+        }
+      }
+    }
+
+    double diff = total - totalReceived;
+    String mainCustomer = payers[0]['nameController'].text.trim();
+    if (diff != 0 && mainCustomer.isNotEmpty && mainCustomer != "زبون عام") {
+       String title = diff > 0 ? "تأكيد تسجيل متبقي (دين)" : "تأكيد تسجيل فائض (رصيد)";
+       String content = diff > 0
+          ? "يوجد مبلغ متبقي ${diff.round()} ₪ لم يغطى. هل تريد تسجيله كدين إضافي على $mainCustomer؟"
+          : "يوجد مبلغ زائد ${diff.abs().round()} ₪. هل تريد تسجيله كرصيد لصالح $mainCustomer؟";
+
+       bool? confirm = await showDialog<bool>(
+         context: context,
+         builder: (c) => Directionality(
+           textDirection: TextDirection.rtl,
+           child: AlertDialog(
+             title: Text(title),
+             content: Text(content),
+             actions: [
+               TextButton(onPressed: () => Navigator.pop(c, false), child: const Text("تجاهل الفرق")),
+               TextButton(onPressed: () => Navigator.pop(c, true), child: const Text("تأكيد التسجيل في الديون")),
+             ],
+           ),
+         ),
+       );
+       if (confirm == null) return;
+       if (ctx.mounted) Navigator.pop(ctx);
+       _submitOrderMultiPayer(total, totalReceived, payers, confirm);
+       return;
+    }
+
+    if (ctx.mounted) Navigator.pop(ctx);
+    _submitOrderMultiPayer(total, totalReceived, payers, true);
+  }
+
+  void _submitOrderMultiPayer(double total, double totalReceived, List<Map<String, dynamic>> payers, bool recordBalanceChange) async {
+    final String cafeId = _activeCafeId ?? widget.currentUser.cafeId;
+
+    try {
+      final result = await OrderService.submitOrder(
+        context: context, currentUser: widget.currentUser, tableId: widget.tableId, tableName: widget.tableName,
+        method: "دين", itemsList: cartNotifier.value.values.toList(), finalTotal: total.roundToDouble(),
+        customerName: payers[0]['nameController'].text.trim().isEmpty ? "زبون عام" : payers[0]['nameController'].text.trim(),
+        customerPhone: payers[0]['phoneController'].text.trim(),
+        selectedCustomerId: payers[0]['id'], autoStartTimer: false,
+        skipSync: true, skipPaymentRecord: true,
+        timerPrice: _currentTimerPrice,
+      );
+      
+      final List allItems = result['items'] ?? [];
+
+      double totalDebtRegisteredDirectly = 0;
+      double totalLiquidRegistered = 0;
+
+      for (int i = 0; i < payers.length; i++) {
+        var p = payers[i];
+        double amt = (double.tryParse(p['amountController'].text.trim()) ?? 0).roundToDouble();
+        if (amt <= 0) continue;
+
+        String pName = p['nameController'].text.trim().isEmpty ? "زبون عام" : p['nameController'].text.trim();
+        String pPhone = p['phoneController'].text.trim();
+        String? pId = p['id'];
+        String pMethod = p['method'];
+
+        if (pMethod == "دين") totalDebtRegisteredDirectly += amt;
+        else totalLiquidRegistered += amt;
+
+        TransferService.performSave(
+          context: context, currentUser: widget.currentUser, customerName: pName,
+          phone: pPhone, amt: amt, method: pMethod,
+          cafeId: cafeId, isDebtPayment: false, selectedDebtId: pId,
+          table: widget.tableName, note: "مشاركة دفع في فاتورة بقيمة ${total.round()}",
+          skipSync: false,
+          items: i == 0 ? allItems : [], 
+        );
+      }
+
+      double unpaidDiff = (total - totalLiquidRegistered - totalDebtRegisteredDirectly).roundToDouble();
+      String mainCustomer = payers[0]['nameController'].text.trim();
+      String mainPhone = payers[0]['phoneController'].text.trim();
+
+      if (mainCustomer != "زبون عام" && recordBalanceChange && unpaidDiff.abs() > 0.01) {
+        TransferService.syncWithDebts(
+          currentUser: widget.currentUser, customerInput: mainCustomer, phone: mainPhone,
+          amount: unpaidDiff.abs(), cafeId: cafeId, selectedId: payers[0]['id'],
+          isAddingDebt: unpaidDiff > 0,
+          type: unpaidDiff > 0 ? "باقي فاتورة" : "رصيد زائد",
+          note: "تسوية نهائية لفاتورة ${widget.tableName} (إجمالي: ${total.round()})",
+        );
+      }
+
+      _clearUIAndPop();
+      ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text("✅ تمت العملية وجاري المزامنة..."), backgroundColor: Colors.green));
+    } catch (e) {
+      debugPrint("Error in multi-payer submission: $e");
+      if (mounted) ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text("❌ خطأ: $e"), backgroundColor: Colors.red));
+    }
+  }
+
+  void _submitOrder(String method, double total) async {
+    final cart = cartNotifier.value;
+    try {
+      await OrderService.submitOrder(
+        context: context,
+        currentUser: widget.currentUser,
+        tableId: widget.tableId,
+        tableName: widget.tableName,
+        method: method,
+        itemsList: cart.values.toList(),
+        finalTotal: total.roundToDouble(),
+        customerName: _nameController.text.isEmpty ? "زبون عام" : _nameController.text,
+        customerPhone: _phoneController.text.trim(),
+        selectedCustomerId: _selectedCustomerId,
+        autoStartTimer: false,
+        timerPrice: _currentTimerPrice,
+      );
+      _clearUIAndPop();
+    } catch (e) {
+      debugPrint("Order Submission Error: $e");
+    }
+  }
+
+  void _clearUIAndPop() {
+    if (!mounted) return;
+    cartNotifier.value = {};
+    _nameController.clear();
+    _phoneController.clear();
+    _receivedAmountController.clear();
+    _barcodeInputController.clear();
+    _selectedCustomerId = null;
+    _selectedCustomerBalance = null;
+    _selectedCustomerLimit = null;
+    if (Navigator.canPop(context)) Navigator.pop(context);
+  }
 }

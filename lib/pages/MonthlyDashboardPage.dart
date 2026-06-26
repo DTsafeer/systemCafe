@@ -3,6 +3,7 @@ import 'package:cloud_firestore/cloud_firestore.dart';
 import 'package:intl/intl.dart';
 import 'package:fl_chart/fl_chart.dart';
 import 'user_model.dart';
+import 'MainLayout.dart';
 
 class MonthlyDashboardPage extends StatefulWidget {
   final User currentUser;
@@ -22,7 +23,6 @@ class _MonthlyDashboardPageState extends State<MonthlyDashboardPage> {
     _fetchSettings();
   }
 
-  // جلب إعدادات العملة الخاصة بالكافيه الحالي
   void _fetchSettings() async {
     try {
       var doc = await FirebaseFirestore.instance
@@ -39,119 +39,139 @@ class _MonthlyDashboardPageState extends State<MonthlyDashboardPage> {
 
   @override
   Widget build(BuildContext context) {
-    return Scaffold(
-      backgroundColor: Colors.grey[100],
-      appBar: AppBar(
-        title: const Text("التقرير المالي الشهري", style: TextStyle(fontWeight: FontWeight.bold)),
-        centerTitle: true,
-        actions: [
-          IconButton(
-            icon: const Icon(Icons.calendar_view_month),
-            onPressed: () => _selectMonth(context),
-          )
-        ],
-      ),
-      body: StreamBuilder<QuerySnapshot>(
-        // ✅ التعديل: فلترة المبيعات حسب الكافيه الحالي فقط
-        stream: FirebaseFirestore.instance
-            .collection('payments')
-            .where('cafeId', isEqualTo: widget.currentUser.cafeId)
-            .where('year', isEqualTo: selectedMonth.year)
-            .where('month', isEqualTo: selectedMonth.month)
-            .snapshots(),
-        builder: (context, paymentSnapshot) {
-          return StreamBuilder<QuerySnapshot>(
-            // ✅ التعديل: فلترة المصروفات حسب الكافيه الحالي فقط
-            stream: FirebaseFirestore.instance
-                .collection('expenses')
-                .where('cafeId', isEqualTo: widget.currentUser.cafeId)
-                .snapshots(),
-            builder: (context, expenseSnapshot) {
+    final String managerId = widget.currentUser.parentId ?? widget.currentUser.id;
 
-              if (paymentSnapshot.hasError) return Center(child: Text("خطأ: ${paymentSnapshot.error}"));
-              if (paymentSnapshot.connectionState == ConnectionState.waiting) return const Center(child: CircularProgressIndicator());
+    return MainLayout(
+      currentUser: widget.currentUser,
+      currentPage: 'reports_monthly',
+      child: Scaffold(
+        backgroundColor: Colors.grey[100],
+        appBar: AppBar(
+          title: const Text("التقرير المالي الشهري", style: TextStyle(fontWeight: FontWeight.bold)),
+          centerTitle: true,
+          actions: [
+            IconButton(
+              icon: const Icon(Icons.calendar_view_month),
+              onPressed: () => _selectMonth(context),
+            )
+          ],
+        ),
+        body: StreamBuilder<QuerySnapshot>(
+          // إزالة فلاتر التاريخ من الاستعلام لتجنب الحاجة لفهرس مركب
+          stream: FirebaseFirestore.instance
+              .collection('payments')
+              .where('cafeId', isEqualTo: widget.currentUser.cafeId)
+              .where('parentId', isEqualTo: managerId)
+              .snapshots(),
+          builder: (context, paymentSnapshot) {
+            return StreamBuilder<QuerySnapshot>(
+              stream: FirebaseFirestore.instance
+                  .collection('expenses')
+                  .where('cafeId', isEqualTo: widget.currentUser.cafeId)
+                  .where('parentId', isEqualTo: managerId)
+                  .snapshots(),
+              builder: (context, expenseSnapshot) {
 
-              double totalSales = 0;
-              Map<String, int> productSalesCount = {};
-              Map<String, double> waiterPerformance = {};
+                if (paymentSnapshot.hasError) return Center(child: Text("خطأ في الاتصال بالبيانات"));
+                if (paymentSnapshot.connectionState == ConnectionState.waiting) return const Center(child: CircularProgressIndicator());
 
-              // --- معالجة مبيعات الشهر ---
-              final payments = paymentSnapshot.data?.docs ?? [];
-              for (var doc in payments) {
-                final data = doc.data() as Map<String, dynamic>;
-                double amount = (data['total_amount'] ?? 0).toDouble();
-                totalSales += amount;
+                double totalSales = 0;
+                Map<String, int> productSalesCount = {};
+                Map<String, double> waiterPerformance = {};
 
-                String waiter = data['processed_by'] ?? "غير معروف";
-                waiterPerformance[waiter] = (waiterPerformance[waiter] ?? 0) + amount;
+                // فلترة المبيعات يدوياً للشهر والسنة المختارة
+                final allPayments = paymentSnapshot.data?.docs ?? [];
+                for (var doc in allPayments) {
+                  final data = doc.data() as Map<String, dynamic>;
+                  
+                  int? m = data['month'];
+                  int? y = data['year'];
+                  if (m == null || y == null) {
+                    if (data['paid_at'] != null) {
+                      DateTime dt = (data['paid_at'] as Timestamp).toDate();
+                      m = dt.month;
+                      y = dt.year;
+                    }
+                  }
 
-                if (data.containsKey('items') && data['items'] is List) {
-                  for (var item in data['items']) {
-                    String pName = item['name'] ?? "صنف";
-                    int qty = (item['quantity'] ?? 1).toInt();
-                    productSalesCount[pName] = (productSalesCount[pName] ?? 0) + qty;
+                  if (m == selectedMonth.month && y == selectedMonth.year) {
+                    // استثناء سداد الديون من إجمالي المبيعات لمنع التكرار
+                    if (data['is_debt_payment'] != true) {
+                      double amount = double.tryParse(data['total_amount']?.toString() ?? "0") ?? 0.0;
+                      totalSales += amount;
+
+                      String waiter = data['processed_by'] ?? "غير معروف";
+                      waiterPerformance[waiter] = (waiterPerformance[waiter] ?? 0) + amount;
+
+                      if (data.containsKey('items') && data['items'] is List) {
+                        for (var item in data['items']) {
+                          String pName = item['name'] ?? "صنف";
+                          int qty = (item['quantity'] ?? 0).toInt();
+                          productSalesCount[pName] = (productSalesCount[pName] ?? 0) + qty;
+                        }
+                      }
+                    }
                   }
                 }
-              }
 
-              // --- معالجة مصروفات الشهر ---
-              double totalExpenses = 0;
-              final allExpenses = expenseSnapshot.data?.docs ?? [];
-              for (var doc in allExpenses) {
-                final expData = doc.data() as Map<String, dynamic>;
-                if (expData['date'] == null) continue;
+                double totalExpenses = 0;
+                final allExpenses = expenseSnapshot.data?.docs ?? [];
+                for (var doc in allExpenses) {
+                  final expData = doc.data() as Map<String, dynamic>;
+                  if (expData['date'] == null) continue;
 
-                DateTime expDate = (expData['date'] as Timestamp).toDate();
-                // التحقق من مطابقة السنة والشهر يدوياً في الكود
-                if (expDate.year == selectedMonth.year && expDate.month == selectedMonth.month) {
-                  totalExpenses += (expData['amount'] ?? 0).toDouble();
+                  DateTime expDate = (expData['date'] is Timestamp) 
+                    ? (expData['date'] as Timestamp).toDate() 
+                    : (DateTime.tryParse(expData['date'].toString()) ?? DateTime.now());
+                    
+                  if (expDate.year == selectedMonth.year && expDate.month == selectedMonth.month) {
+                    totalExpenses += double.tryParse(expData['amount']?.toString() ?? "0") ?? 0.0;
+                  }
                 }
-              }
 
-              double netProfit = totalSales - totalExpenses;
-              var sortedProducts = productSalesCount.entries.toList()
-                ..sort((a, b) => b.value.compareTo(a.value));
+                double netProfit = totalSales - totalExpenses;
+                var sortedProducts = productSalesCount.entries.toList()
+                  ..sort((a, b) => b.value.compareTo(a.value));
 
-              return ListView(
-                padding: const EdgeInsets.all(16),
-                children: [
-                  _buildSectionTitle("ملخص شهر: ${DateFormat('MMMM yyyy', 'ar').format(selectedMonth)}"),
-                  const SizedBox(height: 12),
-                  _buildProfitCard(netProfit),
-                  const SizedBox(height: 12),
-                  Row(
-                    children: [
-                      _buildStatCard("إجمالي المبيعات", "$totalSales", Colors.green),
-                      const SizedBox(width: 10),
-                      _buildStatCard("إجمالي المصاريف", "$totalExpenses", Colors.redAccent),
-                    ],
-                  ),
-                  const SizedBox(height: 25),
-
-                  // الرسم البياني يظهر فقط إذا كانت هناك بيانات
-                  if (totalSales > 0 || totalExpenses > 0) ...[
-                    _buildSectionTitle("توزيع السيولة الشهري"),
-                    _buildPieChart(totalSales, totalExpenses),
+                return ListView(
+                  padding: const EdgeInsets.all(16),
+                  children: [
+                    _buildSectionTitle("ملخص شهر: ${DateFormat('MMMM yyyy', 'ar').format(selectedMonth)}"),
+                    const SizedBox(height: 12),
+                    _buildProfitCard(netProfit),
+                    const SizedBox(height: 12),
+                    Row(
+                      children: [
+                        _buildStatCard("إجمالي المبيعات", "${totalSales.toStringAsFixed(1)}", Colors.green),
+                        const SizedBox(width: 10),
+                        _buildStatCard("إجمالي المصاريف", "${totalExpenses.toStringAsFixed(1)}", Colors.redAccent),
+                      ],
+                    ),
                     const SizedBox(height: 25),
+
+                    if (totalSales > 0 || totalExpenses > 0) ...[
+                      _buildSectionTitle("توزيع السيولة الشهري"),
+                      _buildPieChart(totalSales, totalExpenses),
+                      const SizedBox(height: 25),
+                    ],
+
+                    _buildSectionTitle("الأصناف الأكثر مبيعاً في الشهر"),
+                    _buildTopProductsList(sortedProducts.take(10).toList()),
+
+                    const SizedBox(height: 25),
+                    _buildSectionTitle("أداء الموظفين (إجمالي الشهر)"),
+                    _buildWaiterPerformance(waiterPerformance),
+                    const SizedBox(height: 100),
                   ],
-
-                  _buildSectionTitle("الأصناف الأكثر مبيعاً في الشهر"),
-                  _buildTopProductsList(sortedProducts.take(10).toList()),
-
-                  const SizedBox(height: 25),
-                  _buildSectionTitle("أداء الموظفين (إجمالي الشهر)"),
-                  _buildWaiterPerformance(waiterPerformance),
-                  const SizedBox(height: 100),
-                ],
-              );
-            },
-          );
-        },
+                );
+              },
+            );
+          },
+        ),
       ),
     );
   }
 
-  // دالة اختيار التاريخ (تم تحديثها لتكون أكثر دقة)
   Future<void> _selectMonth(BuildContext context) async {
     final DateTime? picked = await showDatePicker(
       context: context,
@@ -159,13 +179,12 @@ class _MonthlyDashboardPageState extends State<MonthlyDashboardPage> {
       firstDate: DateTime(2020),
       lastDate: DateTime.now(),
       helpText: "اختر الشهر المطلوب",
+      locale: const Locale('ar', 'SA'),
     );
     if (picked != null && picked != selectedMonth) {
       setState(() => selectedMonth = picked);
     }
   }
-
-  // --- Widgets البناء مع الحفاظ على التصميم الأصلي ---
 
   Widget _buildSectionTitle(String title) => Padding(
     padding: const EdgeInsets.symmetric(vertical: 8.0),
@@ -206,9 +225,9 @@ class _MonthlyDashboardPageState extends State<MonthlyDashboardPage> {
   );
 
   Widget _buildPieChart(double sales, double expenses) {
-    // منع حدوث خطأ إذا كانت القيم صفرية في الرسم البياني
-    double sVal = sales == 0 && expenses == 0 ? 1 : sales;
+    double sVal = sales;
     double eVal = expenses;
+    if (sVal == 0 && eVal == 0) sVal = 1;
 
     return Container(
       height: 200,

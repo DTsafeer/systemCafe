@@ -1,6 +1,6 @@
 import 'package:flutter/material.dart';
 import 'package:cloud_firestore/cloud_firestore.dart';
-import 'package:intl/intl.dart';
+import '../widgets/log_widgets.dart';
 
 class CafeLogsPage extends StatelessWidget {
   const CafeLogsPage({super.key});
@@ -8,7 +8,10 @@ class CafeLogsPage extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     return Scaffold(
-      appBar: AppBar(title: const Text("سجل عمليات الكافيهات")),
+      appBar: AppBar(
+        title: const Text("سجل عمليات الكافيهات", style: TextStyle(fontWeight: FontWeight.bold)),
+        centerTitle: true,
+      ),
       body: StreamBuilder<QuerySnapshot>(
         stream: FirebaseFirestore.instance
             .collection('cafe_logs')
@@ -18,28 +21,22 @@ class CafeLogsPage extends StatelessWidget {
           if (!snapshot.hasData) return const Center(child: CircularProgressIndicator());
 
           var logs = snapshot.data!.docs;
-          if (logs.isEmpty) return const Center(child: Text("لا توجد سجلات حالياً"));
+          if (logs.isEmpty) return const Center(child: Text("لا توجد سجلات حالياً", style: TextStyle(color: Colors.grey)));
 
           return ListView.builder(
+            padding: const EdgeInsets.all(15),
             itemCount: logs.length,
             itemBuilder: (context, index) {
               var log = logs[index].data() as Map<String, dynamic>;
               DateTime time = (log['timestamp'] as Timestamp?)?.toDate() ?? DateTime.now();
 
-              return Card(
-                margin: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
-                child: ListTile(
-                  leading: const CircleAvatar(
-                    backgroundColor: Colors.blueGrey,
-                    child: Icon(Icons.history, color: Colors.white),
-                  ),
-                  title: Text("${log['cafeName']} - ${log['action']}"),
-                  subtitle: Text("بواسطة: ${log['adminEmail']}\nالتفاصيل: ${log['details']}"),
-                  trailing: Text(
-                    DateFormat('MM/dd\nHH:mm').format(time),
-                    style: const TextStyle(fontSize: 10, color: Colors.grey),
-                  ),
-                ),
+              return ActivityLogCard(
+                user: log['cafeName'] ?? "كافيه",
+                action: log['action'] ?? "",
+                details: "بواسطة: ${log['adminEmail']}\n${log['details']}",
+                timestamp: time,
+                icon: Icons.business_center_rounded,
+                color: Colors.blueGrey,
               );
             },
           );

@@ -1,10 +1,10 @@
 import 'package:flutter/material.dart';
-import 'package:cloud_firestore/cloud_firestore.dart';
-import 'package:shared_preferences/shared_preferences.dart';
-import '../main.dart';
+import '../widgets/app_components.dart';
+import 'AuthService.dart';
 import 'SuperAdminPage.dart';
 import 'homepage.dart';
 import 'user_model.dart';
+import 'ActivationPage.dart';
 
 class LoginPage extends StatefulWidget {
   const LoginPage({super.key});
@@ -14,10 +14,8 @@ class LoginPage extends StatefulWidget {
 }
 
 class _LoginPageState extends State<LoginPage> {
-  // تعريف وحدات التحكم للنصوص
   final TextEditingController _userController = TextEditingController();
   final TextEditingController _passwordController = TextEditingController();
-
   bool _isLoading = false;
   bool _obscurePassword = true;
 
@@ -28,184 +26,158 @@ class _LoginPageState extends State<LoginPage> {
   }
 
   Future<void> _checkAutoLogin() async {
-    final prefs = await SharedPreferences.getInstance();
-    if (prefs.getBool('isLoggedIn') == true) {
-      _navigateToTarget();
+    setState(() => _isLoading = true);
+    final user = await AuthService.checkAutoLogin();
+    if (user != null && mounted) {
+      _navigateToTarget(user);
+    } else {
+      if (mounted) setState(() => _isLoading = false);
     }
   }
 
-  // الدالة الأساسية لتسجيل الدخول التقليدي
   Future<void> _handleLogin() async {
     final String username = _userController.text.trim().toLowerCase();
     final String password = _passwordController.text.trim();
-
-    if (username.isEmpty || password.isEmpty) {
-      _showError("يرجى إدخال اسم المستخدم وكلمة المرور");
-      return;
-    }
+    if (username.isEmpty || password.isEmpty) return;
 
     setState(() => _isLoading = true);
-
     try {
-      // البحث في Firestore عن مستخدم يطابق الاسم وكلمة المرور
-      final userQuery = await FirebaseFirestore.instance
-          .collection('users')
-          .where('username', isEqualTo: username)
-          .where('password', isEqualTo: password)
-          .limit(1)
-          .get();
-
-      if (userQuery.docs.isEmpty) {
-        throw 'اسم المستخدم أو كلمة المرور غير صحيحة';
-      }
-
-      final userDoc = userQuery.docs.first;
-      final userData = userDoc.data();
-
-      if (userData['isActive'] == false) throw 'عذراً، هذا الحساب معطل حالياً.';
-
-      bool isSuper = (userData['isOwner'] == true || userData['role'] == 'super_admin');
-
-      if (isSuper) {
-        setState(() => _isLoading = false);
-        _showMasterKeyDialog(username, userData, userDoc.id);
-      } else {
-        await _proceedWithLogin(username, userData, userDoc.id);
-      }
-
+      final user = await AuthService.login(username, password);
+      await AuthService.saveSession(user);
+      if (mounted) _navigateToTarget(user);
     } catch (e) {
-      _showError(e.toString());
-      setState(() => _isLoading = false);
-    }
-  }
-
-  // نفس منطق الـ Master Key الخاص بك
-  void _showMasterKeyDialog(String username, Map<String, dynamic> userData, String docId) {
-    final TextEditingController _keyController = TextEditingController();
-    const String secretMasterKey = "salah120212581@admin.flora";
-
-    showDialog(
-      context: context,
-      barrierDismissible: false,
-      builder: (context) => AlertDialog(
-        title: const Text("تأكيد هوية المدير"),
-        content: TextField(
-          controller: _keyController,
-          obscureText: true,
-          decoration: const InputDecoration(labelText: "Security Key"),
-        ),
-        actions: [
-          TextButton(onPressed: () => Navigator.pop(context), child: const Text("إلغاء")),
-          ElevatedButton(
-            onPressed: () async {
-              if (_keyController.text == secretMasterKey) {
-                Navigator.pop(context);
-                await _proceedWithLogin(username, userData, docId);
-              } else {
-                _showError("كود الأمان خاطئ");
-              }
-            },
-            child: const Text("تأكيد"),
-          )
-        ],
-      ),
-    );
-  }
-
-  Future<void> _proceedWithLogin(String username, Map<String, dynamic> userData, String docId) async {
-    final prefs = await SharedPreferences.getInstance();
-    String newSessionToken = DateTime.now().millisecondsSinceEpoch.toString();
-
-    await FirebaseFirestore.instance.collection('users').doc(docId).update({
-      'currentSessionToken': newSessionToken,
-      'isOnline': true,
-      'lastLogin': FieldValue.serverTimestamp(),
-    });
-
-    await prefs.setString('session_email', username);
-    await prefs.setString('session_token', newSessionToken); // حفظ التوكن للتحقق من الجلسة
-    await prefs.setBool('isLoggedIn', true);
-    await prefs.setString('cafe_id', userData['cafeId'] ?? "");
-    _navigateToTarget();
-  }
-
-  void _navigateToTarget() async {
-    if (!mounted) return;
-    
-    final prefs = await SharedPreferences.getInstance();
-    final String username = prefs.getString('session_email') ?? "";
-    
-    if (username.isEmpty) return;
-
-    final userQuery = await FirebaseFirestore.instance.collection('users').where('username', isEqualTo: username).limit(1).get();
-
-    if (userQuery.docs.isNotEmpty && mounted) {
-      final userData = userQuery.docs.first.data();
-      final User currentUser = User.fromMap(userData, userQuery.docs.first.id);
-
-      if (userData['role'] == 'super_admin' || userData['isOwner'] == true) {
-        Navigator.pushReplacement(context, MaterialPageRoute(builder: (_) => const SuperAdminPage()));
-      } else {
-        MyApp.updateTheme(context);
-        Navigator.pushReplacement(context, MaterialPageRoute(builder: (_) => Homepage(currentUser: currentUser)));
+      if (mounted) {
+        String errorMsg = e.toString();
+        if (errorMsg == 'DEVICE_MISMATCH') {
+          errorMsg = "❌ هذا الحساب مرتبط بجهاز آخر بالفعل. يرجى مراجعة مدير النظام لفك الارتباط.";
+        }
+        ScaffoldMessenger.of(context).showSnackBar(SnackBar(
+          content: Text(errorMsg),
+          backgroundColor: Colors.redAccent,
+        ));
+        setState(() => _isLoading = false);
       }
     }
   }
 
-  void _showError(String message) {
-    ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(message), backgroundColor: Colors.red));
+  void _navigateToTarget(User user) {
+    if (user.role == UserRole.super_admin) {
+      Navigator.pushReplacement(context, MaterialPageRoute(builder: (_) => const SuperAdminPage()));
+    } else {
+      Navigator.pushReplacement(context, MaterialPageRoute(builder: (_) => HomePage(currentUser: user)));
+    }
   }
 
   @override
   Widget build(BuildContext context) {
-    return Scaffold(
-      backgroundColor: Colors.brown[50],
-      body: Center(
-        child: SingleChildScrollView(
-          padding: const EdgeInsets.all(30),
-          child: Column(
-            children: [
-              const Icon(Icons.local_cafe, size: 80, color: Colors.brown),
-              const SizedBox(height: 20),
-              const Text("Flora Cafe Login", style: TextStyle(fontSize: 24, fontWeight: FontWeight.bold, color: Colors.brown)),
-              const SizedBox(height: 40),
-              TextField(
-                controller: _userController,
-                decoration: InputDecoration(
-                  labelText: "اسم المستخدم",
-                  border: OutlineInputBorder(borderRadius: BorderRadius.circular(15)),
-                  prefixIcon: const Icon(Icons.person),
-                ),
-              ),
-              const SizedBox(height: 20),
-              TextField(
-                controller: _passwordController,
-                obscureText: _obscurePassword,
-                decoration: InputDecoration(
-                  labelText: "كلمة المرور",
-                  border: OutlineInputBorder(borderRadius: BorderRadius.circular(15)),
-                  prefixIcon: const Icon(Icons.lock),
-                  suffixIcon: IconButton(
-                    icon: Icon(_obscurePassword ? Icons.visibility : Icons.visibility_off),
-                    onPressed: () => setState(() => _obscurePassword = !_obscurePassword),
-                  ),
-                ),
-              ),
-              const SizedBox(height: 40),
-              _isLoading
-                  ? const CircularProgressIndicator()
-                  : ElevatedButton(
-                onPressed: _handleLogin,
-                style: ElevatedButton.styleFrom(
-                  backgroundColor: Colors.brown,
-                  foregroundColor: Colors.white,
-                  minimumSize: const Size(double.infinity, 55),
-                  shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(15)),
-                ),
-                child: const Text("تسجيل الدخول", style: TextStyle(fontSize: 18)),
-              ),
-            ],
+    final theme = Theme.of(context);
+    return Directionality(
+      textDirection: TextDirection.rtl,
+      child: Scaffold(
+        body: Container(
+          width: double.infinity, height: double.infinity,
+          decoration: BoxDecoration(
+            gradient: LinearGradient(
+              colors: [theme.colorScheme.primary, theme.colorScheme.primary.withOpacity(0.7)], 
+              begin: Alignment.topCenter, end: Alignment.bottomCenter
+            )
           ),
+          child: Center(
+            child: SingleChildScrollView(
+              padding: const EdgeInsets.all(30),
+              child: _LoginCard(
+                userController: _userController,
+                passwordController: _passwordController,
+                isLoading: _isLoading,
+                obscurePassword: _obscurePassword,
+                onObscurePressed: () => setState(() => _obscurePassword = !_obscurePassword),
+                onLoginPressed: _handleLogin,
+                onActivationPressed: () => Navigator.push(context, MaterialPageRoute(builder: (_) => const ActivationPage())),
+              ),
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+class _LoginCard extends StatelessWidget {
+  final TextEditingController userController;
+  final TextEditingController passwordController;
+  final bool isLoading;
+  final bool obscurePassword;
+  final VoidCallback onObscurePressed;
+  final VoidCallback onLoginPressed;
+  final VoidCallback onActivationPressed;
+
+  const _LoginCard({
+    required this.userController,
+    required this.passwordController,
+    required this.isLoading,
+    required this.obscurePassword,
+    required this.onObscurePressed,
+    required this.onLoginPressed,
+    required this.onActivationPressed,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    final theme = Theme.of(context);
+    return ConstrainedBox(
+      constraints: const BoxConstraints(maxWidth: 450),
+      child: Container(
+        padding: const EdgeInsets.all(30),
+        decoration: BoxDecoration(
+          color: Colors.white, 
+          borderRadius: BorderRadius.circular(30), 
+          boxShadow: const [BoxShadow(color: Colors.black26, blurRadius: 25, offset: Offset(0, 10))]
+        ),
+        child: Column(
+          children: [
+            Container(
+              padding: const EdgeInsets.all(20),
+              decoration: BoxDecoration(color: theme.colorScheme.primary.withOpacity(0.1), shape: BoxShape.circle),
+              child: Icon(Icons.coffee_rounded, size: 60, color: theme.colorScheme.primary),
+            ),
+            const SizedBox(height: 15),
+            const Text("FLORA CAFE POS", style: TextStyle(fontSize: 22, fontWeight: FontWeight.bold, letterSpacing: 1.2)),
+            const Text("نظام إدارة المقاهي والمطاعم", style: TextStyle(fontSize: 12, color: Colors.grey)),
+            const SizedBox(height: 35),
+            TextField(controller: userController, decoration: AppComponents.fieldInput("اسم المستخدم", Icons.person_outline)),
+            const SizedBox(height: 20),
+            TextField(
+              controller: passwordController, 
+              obscureText: obscurePassword, 
+              decoration: AppComponents.fieldInput("كلمة المرور", Icons.lock_outline).copyWith(
+                suffixIcon: IconButton(
+                  icon: Icon(obscurePassword ? Icons.visibility_off : Icons.visibility), 
+                  onPressed: onObscurePressed
+                )
+              )
+            ),
+            const SizedBox(height: 40),
+            isLoading 
+              ? const CircularProgressIndicator() 
+              : SizedBox(
+                  width: double.infinity, height: 55, 
+                  child: ElevatedButton(
+                    onPressed: onLoginPressed, 
+                    style: ElevatedButton.styleFrom(
+                      backgroundColor: theme.colorScheme.primary,
+                      foregroundColor: Colors.white,
+                      shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(15)),
+                      elevation: 5
+                    ), 
+                    child: const Text("دخول للنظام", style: TextStyle(fontWeight: FontWeight.bold, fontSize: 16))
+                  )
+                ),
+            const SizedBox(height: 25),
+            TextButton(
+              onPressed: onActivationPressed,
+              child: Text("تفعيل النظام / إدخال رمز الترخيص", style: TextStyle(color: theme.colorScheme.primary, fontWeight: FontWeight.bold, fontSize: 13)),
+            ),
+          ],
         ),
       ),
     );

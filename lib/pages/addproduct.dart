@@ -1,432 +1,321 @@
 import 'dart:convert';
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart'; 
 import 'package:image_picker/image_picker.dart';
-import 'package:cloud_firestore/cloud_firestore.dart';
 import 'package:http/http.dart' as http;
+import 'package:cloud_firestore/cloud_firestore.dart';
+import 'package:intl/intl.dart' as intl;
+import '../widgets/app_components.dart';
+import '../widgets/product_search_sheet.dart';
 import 'user_model.dart';
+import 'MainLayout.dart';
+import 'CategoryManagementPage.dart';
+import 'activity_logger.dart';
 
 class AddProduct extends StatefulWidget {
   final User currentUser;
-  const AddProduct({super.key, required this.currentUser});
+  final Map<String, dynamic>? productToEdit;
+
+  const AddProduct({super.key, required this.currentUser, this.productToEdit});
 
   @override
   State<AddProduct> createState() => _AddProductState();
 }
 
 class _AddProductState extends State<AddProduct> {
-  // Controllers and State
   final nameController = TextEditingController();
-  final priceController = TextEditingController();
-  bool isUploading = false;
-  String? imageUrl;
-  List<String> categories = [];
-  String? selectedCategory;
-  bool _toKitchen = true;
+  final priceController = TextEditingController(); 
+  final costPriceController = TextEditingController(); 
+  final barcodeController = TextEditingController();
+  
+  final taxController = TextEditingController();
+  final extraCostsController = TextEditingController();
+  final extraDetailsController = TextEditingController();
 
-  // Cloudinary Settings
+  bool isManualPrice = false;
+  bool isUploading = false;
+  bool _isSaving = false;
+  String? imageUrl;
+  List<String> categories = ["عام"];
+  String? selectedCategory;
+
+  List<Map<String, dynamic>> selectedIngredients = [];
+  bool _isEditMode = false;
+  String? _linkedInventoryId; 
+
   final String cloudName = "dbjnnbhaw";
   final String uploadPreset = "floracafe";
 
   @override
   void initState() {
     super.initState();
-    fetchCategories(); // جلب التصنيفات فور بدء الصفحة
-    nameController.addListener(() => setState(() {}));
-    priceController.addListener(() => setState(() {}));
+    _isEditMode = widget.productToEdit != null;
+    
+    if (_isEditMode) {
+      nameController.text = widget.productToEdit!['name'] ?? "";
+      priceController.text = (widget.productToEdit!['price'] ?? 0.0).toString();
+      costPriceController.text = (widget.productToEdit!['costPrice'] ?? 0.0).toString();
+      barcodeController.text = widget.productToEdit!['barcode'] ?? "";
+      imageUrl = widget.productToEdit!['imagePath'];
+      selectedCategory = widget.productToEdit!['category']?.toString().trim();
+      isManualPrice = widget.productToEdit!['isManualPrice'] ?? (widget.productToEdit!['price'] == 0);
+      
+      _linkedInventoryId = widget.productToEdit!['id'];
+      
+      taxController.text = (widget.productToEdit!['tax'] ?? "").toString();
+      extraCostsController.text = (widget.productToEdit!['extraCosts'] ?? "").toString();
+      extraDetailsController.text = widget.productToEdit!['extraDetails'] ?? "";
+
+      if (selectedCategory != null && !categories.contains(selectedCategory)) {
+        categories.add(selectedCategory!);
+      }
+      selectedIngredients = List<Map<String, dynamic>>.from(widget.productToEdit!['ingredients'] ?? []);
+    }
+    _loadCategories();
+  }
+
+  Future<void> _loadCategories() async {
+    try {
+      final String managerId = widget.currentUser.parentId ?? widget.currentUser.id;
+      final snapshot = await FirebaseFirestore.instance
+          .collection('categories')
+          .where('cafeId', isEqualTo: widget.currentUser.cafeId)
+          .where('parentId', isEqualTo: managerId)
+          .get();
+
+      if (mounted) {
+        setState(() {
+          final fetched = snapshot.docs.map((doc) => doc['name'].toString().trim()).toList();
+          Set<String> allCats = {"عام", ...fetched};
+          if (selectedCategory != null) allCats.add(selectedCategory!);
+          categories = allCats.toList();
+          selectedCategory ??= "عام";
+        });
+      }
+    } catch (e) { debugPrint("Error: $e"); }
+  }
+
+  void _linkExistingInventory() {
+    showModalBottomSheet(
+      context: context,
+      isScrollControlled: true,
+      shape: const RoundedRectangleBorder(borderRadius: BorderRadius.vertical(top: Radius.circular(25))),
+      builder: (ctx) => ProductSearchSheet(
+        activeCafeId: widget.currentUser.cafeId,
+        managerId: widget.currentUser.parentId ?? widget.currentUser.id,
+        onItemSelected: (id, name, qty, unit) {
+          setState(() {
+            _linkedInventoryId = id;
+            nameController.text = name;
+          });
+          ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text("✅ تم ربط المنتج بصنف من المخزن")));
+        },
+      ),
+    );
+  }
+
+  void _saveProduct() async {
+    if (nameController.text.isEmpty || (priceController.text.isEmpty && !isManualPrice)) {
+      ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text("يرجى إكمال البيانات الأساسية")));
+      return;
+    }
+    
+    HapticFeedback.mediumImpact();
+    setState(() => _isSaving = true);
+    
+    final String productId = _linkedInventoryId ?? (_isEditMode ? widget.productToEdit!['id'] : FirebaseFirestore.instance.collection('products').doc().id);
+    
+    final productData = {
+      'name': nameController.text.trim(),
+      'price': isManualPrice ? 0.0 : (double.tryParse(priceController.text.trim()) ?? 0.0),
+      'costPrice': double.tryParse(costPriceController.text.trim()) ?? 0.0,
+      'barcode': barcodeController.text.trim(),
+      'category': selectedCategory,
+      'imagePath': imageUrl ?? "",
+      'ingredients': List.from(selectedIngredients),
+      'isManualPrice': isManualPrice,
+      'trackInventory': true, // مفعل دائماً لضمان الخصم من المخزن عند البيع
+      'cafeId': widget.currentUser.cafeId,
+      'parentId': widget.currentUser.parentId ?? widget.currentUser.id,
+      'isAvailable': true,
+      'tax': double.tryParse(taxController.text) ?? 0.0,
+      'extraCosts': double.tryParse(extraCostsController.text) ?? 0.0,
+      'extraDetails': extraDetailsController.text.trim(),
+      'created_at': _isEditMode ? widget.productToEdit!['created_at'] : FieldValue.serverTimestamp(),
+      'last_update': FieldValue.serverTimestamp(),
+    };
+
+    try {
+      await FirebaseFirestore.instance.collection('products').doc(productId).set(productData, SetOptions(merge: true));
+
+      await ActivityLogger.log(
+        cafeId: widget.currentUser.cafeId,
+        parentId: widget.currentUser.parentId ?? widget.currentUser.id,
+        userId: widget.currentUser.id,
+        userName: widget.currentUser.name,
+        action: _isEditMode ? "منيو - تعديل" : "منيو - إضافة",
+        details: "${_isEditMode ? 'تعديل' : 'إضافة'} منتج: ${productData['name']} بسعر ${productData['price']} ₪",
+      );
+
+      if (mounted) {
+        setState(() => _isSaving = false);
+        Navigator.pop(context);
+      }
+    } catch (e) {
+      if (mounted) {
+        setState(() => _isSaving = false);
+        ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text("خطأ أثناء الحفظ: $e")));
+      }
+    }
   }
 
   @override
   void dispose() {
     nameController.dispose();
     priceController.dispose();
+    costPriceController.dispose();
+    barcodeController.dispose();
+    taxController.dispose();
+    extraCostsController.dispose();
+    extraDetailsController.dispose();
     super.dispose();
   }
 
-  // ---  ✅ تم التعديل هنا ✅ ---
-  /// جلب التصنيفات الخاصة بهذا الكافيه فقط بالاعتماد على المستخدم الحالي
-  Future<void> fetchCategories() async {
-    // استخدام cafeId مباشرة من المستخدم الحالي لضمان الدقة
-    final String cafeId = widget.currentUser.cafeId;
+  @override
+  Widget build(BuildContext context) {
+    final theme = Theme.of(context);
+    return MainLayout(
+      currentUser: widget.currentUser, currentPage: 'menu',
+      child: Scaffold(
+        backgroundColor: Colors.transparent,
+        appBar: AppBar(
+          title: Text(_isEditMode ? "تعديل منتج" : "إضافة منتج مبيعات", style: const TextStyle(fontSize: 18, fontWeight: FontWeight.bold)), 
+          backgroundColor: Colors.white, foregroundColor: Colors.black, elevation: 0.5,
+        ),
+        body: Stack(
+          children: [
+            SingleChildScrollView(
+              padding: const EdgeInsets.all(20),
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  _buildImagePicker(theme.primaryColor),
+                  const SizedBox(height: 25),
+                  Row(
+                    children: [
+                      Expanded(child: TextField(controller: nameController, decoration: AppComponents.fieldInput("اسم المنتج", Icons.fastfood_outlined))),
+                      const SizedBox(width: 10),
+                      IconButton.filledTonal(onPressed: _isEditMode ? null : _linkExistingInventory, icon: const Icon(Icons.link), tooltip: "ربط مع صنف من المخزن"),
+                    ],
+                  ),
+                  const SizedBox(height: 15),
+                  TextField(
+                    controller: barcodeController, 
+                    decoration: InputDecoration(
+                      labelText: "الباركود",
+                      prefixIcon: const Icon(Icons.qr_code_scanner),
+                      filled: true, fillColor: Colors.grey[100],
+                      border: OutlineInputBorder(borderRadius: BorderRadius.circular(15), borderSide: BorderSide.none),
+                    )
+                  ),
+                  const SizedBox(height: 25),
+                  const Text("بيانات التسعير والربح", style: TextStyle(fontWeight: FontWeight.bold, fontSize: 16)),
+                  const SizedBox(height: 10),
+                  SwitchListTile(
+                    contentPadding: EdgeInsets.zero,
+                    title: const Text("سعر متغير (ميزان / وزن)", style: TextStyle(fontWeight: FontWeight.bold, fontSize: 14)),
+                    value: isManualPrice, activeColor: theme.primaryColor,
+                    onChanged: (v) => setState(() => isManualPrice = v),
+                  ),
+                  if (!isManualPrice) ...[
+                    Row(
+                      children: [
+                        Expanded(child: TextField(controller: costPriceController, keyboardType: TextInputType.number, decoration: AppComponents.fieldInput("سعر التكلفة", Icons.shopping_bag_outlined))),
+                        const SizedBox(width: 10),
+                        Expanded(child: TextField(controller: priceController, keyboardType: TextInputType.number, decoration: AppComponents.fieldInput("سعر البيع", Icons.sell_outlined))),
+                      ],
+                    ),
+                  ],
+                  const SizedBox(height: 25),
+                  const Text("الضرائب والتكاليف الإضافية", style: TextStyle(fontWeight: FontWeight.bold, fontSize: 16)),
+                  const SizedBox(height: 10),
+                  Row(
+                    children: [
+                      Expanded(child: TextField(controller: taxController, keyboardType: TextInputType.number, decoration: AppComponents.fieldInput("الضريبة (%)", Icons.percent))),
+                      const SizedBox(width: 10),
+                      Expanded(child: TextField(controller: extraCostsController, keyboardType: TextInputType.number, decoration: AppComponents.fieldInput("تكاليف إضافية", Icons.add_card_outlined))),
+                    ],
+                  ),
+                  const SizedBox(height: 15),
+                  TextField(controller: extraDetailsController, decoration: AppComponents.fieldInput("تفصيل التكاليف الإضافية", Icons.description_outlined)),
+                  const SizedBox(height: 20),
+                  Row(
+                    children: [
+                      Expanded(child: _buildCategoryDropdown()),
+                      const SizedBox(width: 10),
+                      IconButton.filledTonal(onPressed: () => Navigator.push(context, MaterialPageRoute(builder: (_) => CategoryManagementPage(currentUser: widget.currentUser))).then((_) => _loadCategories()), icon: const Icon(Icons.add)),
+                    ],
+                  ),
+                  const SizedBox(height: 40),
+                  ElevatedButton(
+                    onPressed: (_isSaving || isUploading) ? null : _saveProduct,
+                    style: ElevatedButton.styleFrom(backgroundColor: theme.primaryColor, foregroundColor: Colors.white, minimumSize: const Size(double.infinity, 60), shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(18))),
+                    child: _isSaving ? const CircularProgressIndicator(color: Colors.white) : Text(_isEditMode ? "تحديث البيانات" : "حفظ المنتج في المنيو", style: const TextStyle(fontSize: 16, fontWeight: FontWeight.bold)),
+                  ),
+                ],
+              ),
+            ),
+            if (isUploading || _isSaving)
+              Container(
+                color: Colors.black.withOpacity(0.3),
+                child: const Center(child: CircularProgressIndicator()),
+              ),
+          ],
+        ),
+      ),
+    );
+  }
 
-    if (cafeId.isNotEmpty) {
-      final snapshot = await FirebaseFirestore.instance
-          .collection('categories')
-          .where('cafeId', isEqualTo: cafeId) // فلترة حسب الكافيه
-          .get();
+  Widget _buildImagePicker(Color primary) => GestureDetector(
+    onTap: isUploading ? null : _pickImage,
+    child: Container(
+      height: 150, width: double.infinity,
+      decoration: BoxDecoration(color: Colors.grey[50], borderRadius: BorderRadius.circular(25), border: Border.all(color: Colors.grey[200]!, width: 2)),
+      child: isUploading ? const Center(child: CircularProgressIndicator()) : (imageUrl == null ? Column(mainAxisAlignment: MainAxisAlignment.center, children: [Icon(Icons.add_a_photo_outlined, size: 40, color: primary.withOpacity(0.5)), const Text("إضافة صورة", style: TextStyle(color: Colors.grey, fontSize: 12))]) : ClipRRect(borderRadius: BorderRadius.circular(23), child: Image.network(imageUrl!, fit: BoxFit.cover))),
+    ),
+  );
 
-      if (mounted) {
-        setState(() {
-          // فرز التصنيفات أبجدياً لسهولة الوصول
-          categories = snapshot.docs.map((doc) => doc['name'] as String).toList()..sort();
-        });
-      }
-    } else {
-      _showSnackBar("خطأ: لم يتم تحديد المنشأة للمستخدم", Colors.red);
-    }
+  Widget _buildCategoryDropdown() {
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 15),
+      decoration: BoxDecoration(color: Colors.grey[100], borderRadius: BorderRadius.circular(15)),
+      child: DropdownButtonHideUnderline(child: DropdownButton<String>(
+        value: categories.contains(selectedCategory) ? selectedCategory : (categories.isNotEmpty ? categories.first : null), 
+        isExpanded: true, 
+        items: categories.toSet().map((c) => DropdownMenuItem(value: c, child: Text(c))).toList(),
+        onChanged: (v) => setState(() => selectedCategory = v),
+      )),
+    );
   }
 
   Future<void> _pickImage() async {
     final picker = ImagePicker();
     final XFile? image = await picker.pickImage(source: ImageSource.gallery, imageQuality: 50);
     if (image == null) return;
-
-    _showSnackBar("جاري رفع الصورة...", Colors.blue, isLoading: true);
     setState(() => isUploading = true);
-
     try {
       final url = Uri.parse('https://api.cloudinary.com/v1_1/$cloudName/image/upload');
+      final bytes = await image.readAsBytes();
       var request = http.MultipartRequest('POST', url)
         ..fields['upload_preset'] = uploadPreset
-        ..files.add(await http.MultipartFile.fromPath('file', image.path));
-
+        ..files.add(http.MultipartFile.fromBytes('file', bytes, filename: image.name));
       var response = await http.Response.fromStream(await request.send());
-
       if (response.statusCode == 200) {
         var responseData = jsonDecode(response.body);
-        setState(() => imageUrl = responseData['secure_url']);
-        _showSnackBar("تم رفع الصورة بنجاح ✅", Colors.green);
-      } else {
-        throw "فشل رفع الصورة (خطأ ${response.statusCode})";
+        setState(() { imageUrl = responseData['secure_url']; isUploading = false; });
       }
-    } catch (e) {
-      _showSnackBar("خطأ في رفع الصورة: $e ❌", Colors.redAccent);
-    } finally {
-      if(mounted) {
-        ScaffoldMessenger.of(context).hideCurrentSnackBar();
-        setState(() => isUploading = false);
-      }
+    } catch (e) { 
+      setState(() => isUploading = false); 
     }
-  }
-
-  // --- ✅ تم التعديل هنا ✅ ---
-  /// حفظ المنتج مع ربطه بالـ cafeId الخاص بالمستخدم الحالي
-  Future<void> _saveProduct() async {
-    if (nameController.text.isEmpty || priceController.text.isEmpty || selectedCategory == null) {
-      _showSnackBar("يرجى إكمال البيانات (الاسم، السعر، التصنيف) ⚠️", Colors.orange);
-      return;
-    }
-
-    final String cafeId = widget.currentUser.cafeId;
-    if (cafeId.isEmpty) {
-      _showSnackBar("خطأ: لم يتم التعرف على المنشأة للمستخدم الحالي ❌", Colors.red);
-      return;
-    }
-
-    setState(() => isUploading = true);
-
-    try {
-      final batch = FirebaseFirestore.instance.batch();
-      DocumentReference productRef = FirebaseFirestore.instance.collection('products').doc();
-      String productId = productRef.id;
-
-      DocumentReference inventoryRef = FirebaseFirestore.instance.collection('inventory').doc(productId);
-
-      String productName = nameController.text.trim();
-
-      // 1. حفظ المنتج في قائمة المنيو (مربوط بالـ cafeId)
-      batch.set(productRef, {
-        'id': productId,
-        'cafeId': cafeId, // الربط لضمان عدم تداخل البيانات
-        'name': productName,
-        'price': double.tryParse(priceController.text.trim()) ?? 0.0,
-        'category': selectedCategory,
-        'image': imageUrl ?? "",
-        'toKitchen': _toKitchen,
-        'created_at': FieldValue.serverTimestamp(),
-      });
-
-      // 2. حفظ المنتج في المخزن (مربوط بالـ cafeId)
-      batch.set(inventoryRef, {
-        'id': productId,
-        'cafeId': cafeId, // الربط في المخزن أيضاً
-        'name': productName,
-        'image': imageUrl ?? "",
-        'quantity': 0, // الكمية الأولية في المخزن تكون صفر
-        'category': selectedCategory,
-        'last_updated': FieldValue.serverTimestamp(),
-      });
-      DocumentReference logRef = FirebaseFirestore.instance.collection('activity_logs').doc();
-      batch.set(logRef, {
-        'cafeId': widget.currentUser.cafeId,
-        'userName': widget.currentUser.name, // اسم الشخص الذي أضاف المنتج
-        'action': "إضافة منتج جديد",
-        'details': "قام بإضافة المنتج '$productName' بسعر ${priceController.text} ₪ إلى تصنيف $selectedCategory",
-        'timestamp': FieldValue.serverTimestamp(),
-      });
-      await batch.commit();
-
-      _showSnackBar("تم إضافة المنتج للمنيو والمخزن بنجاح ✅", Colors.green);
-
-      // إعادة تعيين الحقول بعد الحفظ
-      nameController.clear();
-      priceController.clear();
-      setState(() {
-        imageUrl = null;
-        selectedCategory = null;
-        _toKitchen = true;
-      });
-
-    } catch (e) {
-      _showSnackBar("حدث خطأ أثناء الحفظ: $e ❌", Colors.red);
-    } finally {
-      if (mounted) setState(() => isUploading = false);
-    }
-  }
-
-  void _showSnackBar(String msg, Color color, {bool isLoading = false}) {
-    if(!mounted) return;
-    ScaffoldMessenger.of(context).hideCurrentSnackBar();
-    ScaffoldMessenger.of(context).showSnackBar(
-      SnackBar(
-        content: Row(
-          children: [
-            if (isLoading) const Padding(padding: EdgeInsets.only(right: 12), child: SizedBox(width: 20, height: 20, child: CircularProgressIndicator(color: Colors.white, strokeWidth: 2))),
-            Expanded(child: Text(msg, textAlign: TextAlign.center)),
-          ],
-        ),
-        backgroundColor: color,
-        duration: Duration(seconds: isLoading ? 60 : 3),
-        behavior: SnackBarBehavior.floating,
-      ),
-    );
-  }
-
-  Future<void> _deleteCategory(String categoryName) async {
-    bool? confirm = await showDialog(
-      context: context,
-      builder: (ctx) => AlertDialog(
-        title: const Text("حذف التصنيف؟"),
-        content: Text("هل أنت متأكد من حذف '$categoryName'؟ سيؤثر هذا على المنتجات المرتبطة به."),
-        actions: [
-          TextButton(onPressed: () => Navigator.pop(ctx), child: const Text("إلغاء")),
-          ElevatedButton(
-            style: ElevatedButton.styleFrom(backgroundColor: Colors.red),
-            onPressed: () => Navigator.pop(ctx, true),
-            child: const Text("حذف", style: TextStyle(color: Colors.white)),
-          ),
-        ],
-      ),
-    );
-
-    if (confirm == true) {
-      final snap = await FirebaseFirestore.instance
-          .collection('categories')
-          .where('cafeId', isEqualTo: widget.currentUser.cafeId) // فلترة إضافية للأمان
-          .where('name', isEqualTo: categoryName)
-          .get();
-
-      for (var doc in snap.docs) {
-        await doc.reference.delete();
-      }
-      // إعادة تعيين القائمة المنسدلة إذا كان التصنيف المحذوف هو المختار
-      if (selectedCategory == categoryName) setState(() => selectedCategory = null);
-      fetchCategories(); // تحديث القائمة
-    }
-  }
-
-  // --- ✅ تم التعديل هنا ✅ ---
-  /// إضافة تصنيف جديد مع ربطه بالـ cafeId الخاص بالمستخدم الحالي
-  Future<void> _addCategoryDialog(ThemeData theme) async {
-    final c = TextEditingController();
-    showDialog(
-      context: context,
-      builder: (ctx) => AlertDialog(
-        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(20)),
-        title: const Text("إضافة تصنيف جديد"),
-        content: TextField(controller: c, autofocus: true, decoration: const InputDecoration(hintText: "مثلاً: مشروبات باردة")),
-        actions: [
-          TextButton(onPressed: () => Navigator.pop(ctx), child: const Text("إلغاء")),
-          ElevatedButton(
-            onPressed: () async {
-              final String categoryName = c.text.trim();
-              if (categoryName.isNotEmpty) {
-                // استخدام cafeId مباشرة من المستخدم الحالي
-                final String cafeId = widget.currentUser.cafeId;
-
-                await FirebaseFirestore.instance.collection('categories').add({
-                  'name': categoryName,
-                  'cafeId': cafeId, // ربط التصنيف الجديد بالكافيه الحالي
-                });
-
-                // تحديث القائمة واختيار التصنيف الجديد تلقائياً
-                await fetchCategories();
-                setState(() {
-                  selectedCategory = categoryName;
-                });
-
-                if(ctx.mounted) Navigator.pop(ctx);
-              }
-            },
-            child: const Text("إضافة"),
-          ),
-        ],
-      ),
-    );
-  }
-
-
-  @override
-  Widget build(BuildContext context) {
-    final theme = Theme.of(context);
-    final primaryColor = theme.colorScheme.primary;
-    final canSave = widget.currentUser.permissions['canEditMenu'] == true;
-
-    return Scaffold(
-      backgroundColor: theme.scaffoldBackgroundColor,
-      appBar: AppBar(
-        title: const Text('إدارة الأصناف', style: TextStyle(fontWeight: FontWeight.bold)),
-        backgroundColor: primaryColor,
-        foregroundColor: theme.colorScheme.onPrimary,
-      ),
-      body: AbsorbPointer(
-        absorbing: isUploading,
-        child: SingleChildScrollView(
-          padding: const EdgeInsets.all(20),
-          child: Column(
-            crossAxisAlignment: CrossAxisAlignment.stretch,
-            children: [
-              GestureDetector(
-                onTap: canSave ? _pickImage : null,
-                child: Container(
-                  height: 180,
-                  decoration: BoxDecoration(
-                    color: theme.cardColor,
-                    borderRadius: BorderRadius.circular(20),
-                    border: Border.all(color: primaryColor.withOpacity(0.2)),
-                    image: imageUrl != null ? DecorationImage(image: NetworkImage(imageUrl!), fit: BoxFit.cover) : null,
-                  ),
-                  child: isUploading
-                      ? Center(child: CircularProgressIndicator(color: primaryColor))
-                      : imageUrl == null
-                      ? Icon(Icons.add_a_photo_outlined, size: 50, color: primaryColor.withOpacity(0.4))
-                      : null,
-                ),
-              ),
-              const SizedBox(height: 20),
-
-              _buildField(theme, nameController, "اسم المنتج", Icons.fastfood_outlined, readOnly: !canSave),
-              const SizedBox(height: 15),
-
-              _buildField(theme, priceController, "السعر", Icons.payments_outlined, isNum: true, suffixText: "₪", readOnly: !canSave),
-              const SizedBox(height: 15),
-
-              Container(
-                decoration: BoxDecoration(
-                    color: theme.cardColor,
-                    borderRadius: BorderRadius.circular(15)
-                ),
-                child: SwitchListTile(
-                  title: const Text("إرسال للمطبخ؟", style: TextStyle(fontWeight: FontWeight.bold)),
-                  subtitle: const Text("للأصناف التي تحتاج تحضير", style: TextStyle(fontSize: 12)),
-                  value: _toKitchen,
-                  activeColor: primaryColor,
-                  onChanged: canSave ? (val) => setState(() => _toKitchen = val) : null,
-                  secondary: Icon(Icons.soup_kitchen_rounded, color: _toKitchen ? primaryColor : Colors.grey),
-                  shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(15)),
-                ),
-              ),
-              const SizedBox(height: 15),
-              Row(
-                children: [
-                  Expanded(
-                    child: Container(
-                      padding: const EdgeInsets.symmetric(horizontal: 16),
-                      decoration: BoxDecoration(
-                        color: theme.cardColor,
-                        borderRadius: BorderRadius.circular(15),
-                      ),
-                      child: DropdownButtonHideUnderline(
-                        child: DropdownButton<String>(
-                          value: selectedCategory,
-                          hint: const Text("اختر التصنيف"),
-                          isExpanded: true,
-                          dropdownColor: theme.cardColor,
-                          onChanged: canSave ? (v) => setState(() => selectedCategory = v) : null,
-                          items: categories.map((String category) {
-                            return DropdownMenuItem<String>(
-                              value: category,
-                              child: Row(
-                                children: [
-                                  Expanded(child: Text(category, overflow: TextOverflow.ellipsis)),
-                                  if (canSave)
-                                    IconButton(
-                                      icon: const Icon(Icons.delete_outline, color: Colors.redAccent, size: 22),
-                                      onPressed: () => _deleteCategory(category),
-                                    ),
-                                ],
-                              ),
-                            );
-                          }).toList(),
-                        ),
-                      ),
-                    ),
-                  ),
-                  if (canSave) ...[
-                    const SizedBox(width: 10),
-                    _smallBtn(primaryColor, Icons.add, () => _addCategoryDialog(theme)),
-                  ]
-                ],
-              ),
-              const SizedBox(height: 30),
-
-              if (canSave)
-                SizedBox(
-                  height: 55,
-                  child: ElevatedButton.icon(
-                    style: ElevatedButton.styleFrom(
-                      backgroundColor: isUploading ? Colors.grey : primaryColor,
-                      foregroundColor: theme.colorScheme.onPrimary,
-                      shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(15)),
-                      elevation: 3,
-                    ),
-                    onPressed: _saveProduct,
-                    icon: isUploading ? const SizedBox.shrink() : const Icon(Icons.save_alt_rounded),
-                    label: isUploading
-                        ? CircularProgressIndicator(color: theme.colorScheme.onPrimary)
-                        : const Text("حفظ المنتج", style: TextStyle(fontSize: 16, fontWeight: FontWeight.bold)),
-                  ),
-                ),
-            ],
-          ),
-        ),
-      ),
-    );
-  }
-
-  Widget _buildField(ThemeData theme, TextEditingController ctrl, String hint, IconData icon, {bool isNum = false, String? suffixText, bool readOnly = false}) {
-    return TextField(
-      controller: ctrl,
-      readOnly: readOnly,
-      keyboardType: isNum ? const TextInputType.numberWithOptions(decimal: true) : TextInputType.text,
-      decoration: InputDecoration(
-        labelText: hint,
-        labelStyle: TextStyle(color: theme.hintColor),
-        prefixIcon: Icon(icon, color: theme.colorScheme.primary),
-        suffixText: suffixText,
-        suffixStyle: TextStyle(color: theme.colorScheme.primary, fontWeight: FontWeight.bold, fontSize: 16),
-        filled: true,
-        fillColor: theme.cardColor,
-        border: OutlineInputBorder(borderRadius: BorderRadius.circular(15), borderSide: BorderSide.none),
-        focusedBorder: OutlineInputBorder(
-          borderRadius: BorderRadius.circular(15),
-          borderSide: BorderSide(color: theme.colorScheme.primary, width: 2),
-        ),
-      ),
-    );
-  }
-
-  Widget _smallBtn(Color color, IconData icon, VoidCallback onTap) {
-    return Material(
-      color: color,
-      borderRadius: BorderRadius.circular(15),
-      child: InkWell(
-        onTap: onTap,
-        borderRadius: BorderRadius.circular(15),
-        child: Container(
-          padding: const EdgeInsets.all(16),
-          child: Icon(icon, color: Colors.white, size: 22),
-        ),
-      ),
-    );
   }
 }
