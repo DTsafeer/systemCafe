@@ -44,7 +44,7 @@ class _PurchasesPageState extends State<PurchasesPage> {
   String? _activeCafeId;
   bool _isLoading = false;
   
-  List<String> _paymentMethods = ["كاش", "شبكة", "دين مورد"];
+  List<String> _paymentMethods = ["كاش", "شبكة", "دين للمورد"];
   String _selectedMethod = "كاش";
   
   // متغيرات الدفع المتعدد
@@ -181,16 +181,17 @@ class _PurchasesPageState extends State<PurchasesPage> {
         _settingsSub = CafeService.streamCafeSettings(cid).listen((settings) {
           if (mounted) {
             setState(() {
-              _paymentMethods = List<String>.from(settings.paymentMethods);
-              for (int i = 0; i < _paymentMethods.length; i++) {
-                if (_paymentMethods[i] == "دين") _paymentMethods[i] = "دين مورد";
+              List<String> methods = ["كاش"];
+              for (var m in settings.paymentMethods) {
+                if (!m.contains("دين") && !m.contains("ديون") && m != "كاش") {
+                  methods.add(m);
+                }
               }
+              if (!methods.contains("دين للمورد")) {
+                methods.add("دين للمورد");
+              }
+              _paymentMethods = methods;
               
-              // التأكد من وجود خيار "دين مورد" دائماً في المشتريات
-              if (!_paymentMethods.contains("دين مورد")) {
-                _paymentMethods.add("دين مورد");
-              }
-
               for (var method in _paymentMethods) {
                 if (!_paymentControllers.containsKey(method)) {
                   _paymentControllers[method] = TextEditingController(text: "0");
@@ -239,8 +240,8 @@ class _PurchasesPageState extends State<PurchasesPage> {
       payments[_selectedMethod] = totalAmount;
     }
 
-    if (payments.containsKey("دين مورد") && _selectedSupplierId == null) {
-      ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text("يجب اختيار اسم المورد عند الدفع بـ 'دين مورد'")));
+    if (payments.containsKey("دين للمورد") && _selectedSupplierId == null) {
+      ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text("يجب اختيار اسم المورد عند الدفع بـ 'دين للمورد'")));
       return;
     }
 

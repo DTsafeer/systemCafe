@@ -22,6 +22,7 @@ class SupplierService {
     required String company,
     required String cafeId,
     required String managerId,
+    double openingBalance = 0.0,
   }) {
     return _db.collection('suppliers').add({
       'name': name,
@@ -29,7 +30,8 @@ class SupplierService {
       'company': company,
       'cafeId': cafeId,
       'parentId': managerId,
-      'totalBalance': 0.0,
+      'openingBalance': openingBalance,
+      'totalBalance': openingBalance, 
       'totalPaid': 0.0,
       'createdAt': FieldValue.serverTimestamp(),
     });
@@ -49,7 +51,6 @@ class SupplierService {
     double remaining = totalAmount - paidAmount;
     final batch = _db.batch();
 
-    // تحديد ما إذا كانت طريقة الدفع هي "دين"
     bool isDebtMethod = method.contains("دين") || method.contains("ديون");
 
     final purchaseRef = _db.collection('purchases').doc();
@@ -67,35 +68,28 @@ class SupplierService {
       'parentId': managerId,
       'processedBy': currentUser.name,
       'added_by': currentUser.name,
-      'method': remaining > 0 ? (paidAmount > 0 ? "مزيج" : "دين مورد") : method,
+      'method': remaining > 0 ? (paidAmount > 0 ? "مزيج" : "دين مورد") : (remaining < 0 ? "دفعة زائدة" : method),
     });
 
-    // تحديث أرصدة المورد بناءً على نوع الدفع
     Map<String, dynamic> supplierUpdates = {};
+    supplierUpdates['totalBalance'] = FieldValue.increment(remaining);
     
-    // 1. المتبقي (remaining) هو دائماً دين
-    if (remaining > 0) {
-      supplierUpdates['totalBalance'] = FieldValue.increment(remaining);
-    }
-    
-    // 2. المبلغ المسدد الآن (paidAmount)
     if (paidAmount > 0) {
       if (isDebtMethod) {
-        // إذا اختار طريقة دفع هي "دين" للمبلغ المسدد (حالة نادرة لكن نعالجها)
         supplierUpdates['totalBalance'] = FieldValue.increment(paidAmount);
       } else {
-        // الدفع الطبيعي (كاش، شبكة، إلخ) يذهب للرصيد المدفوع
         supplierUpdates['totalPaid'] = FieldValue.increment(paidAmount);
       }
     }
     
-    if (supplierUpdates.isNotEmpty) {
-      batch.update(_db.collection('suppliers').doc(supplierId), supplierUpdates);
-    }
+    batch.update(_db.collection('suppliers').doc(supplierId), supplierUpdates);
+
+    // تفاصيل الحركة للفاتورة: سداد (طريقة الدفع)
+    String purchaseType = 'فاتورة #$invoiceNo | سداد ($method)';
 
     batch.set(_db.collection('supplier_transactions').doc(), {
       'supplierId': supplierId,
-      'type': 'شراء فاتورة #$invoiceNo',
+      'type': purchaseType,
       'amount': totalAmount,
       'paid': paidAmount,
       'method': method,
@@ -105,7 +99,6 @@ class SupplierService {
       'processedBy': currentUser.name
     });
 
-    // تسجيل مصاريف فقط إذا كان الدفع غير آجل
     if (paidAmount > 0 && !isDebtMethod) {
       batch.set(_db.collection('expenses').doc(), {
         'title': "سداد للمورد: $supplierName (فاتورة $invoiceNo)",
@@ -134,15 +127,15 @@ class SupplierService {
     final batch = _db.batch();
     bool isDebtMethod = method.contains("دين") || method.contains("ديون");
     
-    // عند تسديد دفعة: ينقص الدين ويزداد إجمالي المدفوع (بشرط ألا تكون طريقة التسديد هي دين آخر)
     batch.update(_db.collection('suppliers').doc(supplierId), {
       'totalBalance': FieldValue.increment(-amount),
       if (!isDebtMethod) 'totalPaid': FieldValue.increment(amount),
     });
 
+    // تفاصيل الحركة للسداد المباشر: سداد (طريقة الدفع)
     batch.set(_db.collection('supplier_transactions').doc(), {
       'supplierId': supplierId,
-      'type': 'سداد نقدي (دفعة)',
+      'type': 'سداد ($method)',
       'amount': amount,
       'isPayment': true,
       'method': method,

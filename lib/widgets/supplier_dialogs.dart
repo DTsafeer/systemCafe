@@ -1,3 +1,4 @@
+import 'dart:math';
 import 'package:flutter/material.dart';
 import 'package:cloud_firestore/cloud_firestore.dart';
 import 'package:intl/intl.dart' as intl;
@@ -14,6 +15,7 @@ class SupplierDialogs {
     final nameCtrl = TextEditingController();
     final phoneCtrl = TextEditingController();
     final companyCtrl = TextEditingController();
+    final openBalCtrl = TextEditingController(text: "0");
     
     showDialog(
       context: context,
@@ -33,6 +35,8 @@ class SupplierDialogs {
                 _popInput(phoneCtrl, "رقم الهاتف", Icons.phone_android, isNum: true),
                 const SizedBox(height: 12),
                 _popInput(companyCtrl, "اسم الشركة / النشاط", Icons.business_outlined),
+                const SizedBox(height: 12),
+                _popInput(openBalCtrl, "رصيد افتتاحي (دين سابق)", Icons.account_balance_wallet_outlined, isNum: true),
                 const SizedBox(height: 30),
                 ElevatedButton(
                   style: ElevatedButton.styleFrom(
@@ -48,6 +52,7 @@ class SupplierDialogs {
                         company: companyCtrl.text.trim(),
                         cafeId: cafeId,
                         managerId: managerId,
+                        openingBalance: double.tryParse(openBalCtrl.text) ?? 0.0,
                       );
                       Navigator.pop(ctx);
                     }
@@ -67,10 +72,22 @@ class SupplierDialogs {
     required User currentUser,
     required String cafeId,
     required String managerId,
+    String? initialSupplierId,
   }) {
-    final invCtrl = TextEditingController(), amtCtrl = TextEditingController(), paidCtrl = TextEditingController();
-    String? selectedSupplierId, selectedSupplierName;
-    String selectedMethod = "كاش"; // الطريقة الافتراضية
+    // توليد رقم فاتورة من 6 خانات (5 أرقام وحرف واحد)
+    final random = Random();
+    const letters = 'ABCDEFGHJKLMNPQRSTUVWXYZ';
+    const digits = '0123456789';
+    List<String> chars = List.generate(5, (i) => digits[random.nextInt(digits.length)]);
+    chars.add(letters[random.nextInt(letters.length)]);
+    chars.shuffle();
+    final String autoInvoiceNo = chars.join();
+    
+    final amtCtrl = TextEditingController(), paidCtrl = TextEditingController();
+          
+    String? selectedSupplierId = initialSupplierId;
+    String? selectedSupplierName;
+    String selectedMethod = "كاش";
     
     showDialog(
       context: context,
@@ -86,44 +103,87 @@ class SupplierDialogs {
                 children: [
                   const Text("تسجيل فاتورة مشتريات", style: TextStyle(fontSize: 20, fontWeight: FontWeight.bold)),
                   const SizedBox(height: 25),
+                  
+                  // صندوق عرض رقم الفاتورة (للمشاهدة فقط)
+                  Container(
+                    width: double.infinity,
+                    padding: const EdgeInsets.symmetric(vertical: 12, horizontal: 15),
+                    decoration: BoxDecoration(
+                      color: Colors.blueGrey[50],
+                      borderRadius: BorderRadius.circular(15),
+                      border: Border.all(color: Colors.blueGrey[100]!),
+                    ),
+                    child: Row(
+                      mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                      children: [
+                        const Row(
+                          children: [
+                            Icon(Icons.tag, color: Colors.blueGrey, size: 18),
+                            SizedBox(width: 8),
+                            Text("رقم الفاتورة الآلي:", style: TextStyle(color: Colors.blueGrey, fontSize: 13, fontWeight: FontWeight.bold)),
+                          ],
+                        ),
+                        Text(autoInvoiceNo, style: const TextStyle(fontWeight: FontWeight.w900, color: Colors.black, fontSize: 16, letterSpacing: 1.5)),
+                      ],
+                    ),
+                  ),
+                  const SizedBox(height: 15),
+
                   StreamBuilder<List<Map<String, dynamic>>>(
                     stream: SupplierService.streamSuppliers(cafeId, managerId),
                     builder: (context, snap) {
                       if (!snap.hasData) return const CircularProgressIndicator();
                       final suppliers = snap.data!;
+                      if (selectedSupplierId != null && selectedSupplierName == null) {
+                        try {
+                          selectedSupplierName = suppliers.firstWhere((s) => s['id'] == selectedSupplierId)['name'];
+                        } catch(_) {}
+                      }
+
                       return DropdownButtonFormField<String>(
+                        value: selectedSupplierId,
                         decoration: InputDecoration(filled: true, fillColor: Colors.grey[50], border: OutlineInputBorder(borderRadius: BorderRadius.circular(15), borderSide: BorderSide.none)),
                         hint: const Text("اختر المورد"),
                         items: suppliers.map((s) => DropdownMenuItem(value: s['id'].toString(), child: Text(s['name']))).toList(),
                         onChanged: (v) { 
                           final s = suppliers.firstWhere((s) => s['id'] == v); 
-                          selectedSupplierId = v; 
-                          selectedSupplierName = s['name']; 
+                          setDialogState(() {
+                            selectedSupplierId = v; 
+                            selectedSupplierName = s['name']; 
+                          });
                         },
                       );
                     },
                   ),
                   const SizedBox(height: 12),
-                  _popInput(invCtrl, "رقم الفاتورة الورقية", Icons.numbers),
-                  const SizedBox(height: 12),
                   _popInput(amtCtrl, "إجمالي مبلغ الفاتورة", Icons.monetization_on_outlined, isNum: true),
                   const SizedBox(height: 12),
-                  _popInput(paidCtrl, "المبلغ المسدد الآن", Icons.payments_outlined, isNum: true),
+                  _popInput(paidCtrl, "المبلغ المسدد الآن", Icons.payments_outlined, isNum: true, onChanged: (_) => setDialogState(() {})),
                   const SizedBox(height: 12),
-                  // إضافة اختيار طريقة الدفع
-                  StreamBuilder<DocumentSnapshot>(
-                    stream: FirebaseFirestore.instance.collection('settings').doc(cafeId).snapshots(),
+                  StreamBuilder<CafeSettings>(
+                    stream: CafeService.streamCafeSettings(cafeId),
                     builder: (context, snap) {
-                      List<String> methods = ["كاش", "شبكة"];
-                      if (snap.hasData && snap.data!.exists) {
-                        methods = List<String>.from(snap.data!['paymentMethods'] ?? ["كاش", "شبكة"]);
-                        methods.removeWhere((m) => m == "دين");
+                      List<String> methods = ["كاش"];
+                      if (snap.hasData) {
+                        for (var m in snap.data!.paymentMethods) {
+                          if (!m.contains("دين") && !m.contains("ديون") && m != "كاش") {
+                            methods.add(m);
+                          }
+                        }
                       }
+                      double paidVal = double.tryParse(paidCtrl.text) ?? 0;
+                      bool isEnabled = paidVal > 0;
+
                       return DropdownButtonFormField<String>(
-                        value: selectedMethod,
-                        decoration: InputDecoration(labelText: "طريقة الدفع", filled: true, fillColor: Colors.grey[50], border: OutlineInputBorder(borderRadius: BorderRadius.circular(15), borderSide: BorderSide.none)),
-                        items: methods.map((m) => DropdownMenuItem(value: m, child: Text(m))).toList(),
-                        onChanged: (v) => setDialogState(() => selectedMethod = v!),
+                        value: methods.contains(selectedMethod) ? selectedMethod : methods.first,
+                        onChanged: isEnabled ? (v) => setDialogState(() => selectedMethod = v!) : null,
+                        decoration: InputDecoration(
+                          labelText: "طريقة الدفع", 
+                          filled: true, 
+                          fillColor: isEnabled ? Colors.grey[50] : Colors.grey[200],
+                          border: OutlineInputBorder(borderRadius: BorderRadius.circular(15), borderSide: BorderSide.none)
+                        ),
+                        items: methods.map((m) => DropdownMenuItem(value: m, child: Text(m, style: TextStyle(color: isEnabled ? Colors.black : Colors.grey)))).toList(),
                       );
                     }
                   ),
@@ -135,7 +195,7 @@ class SupplierDialogs {
                           SupplierService.savePurchaseBill(
                             supplierId: selectedSupplierId!,
                             supplierName: selectedSupplierName!,
-                            invoiceNo: invCtrl.text,
+                            invoiceNo: autoInvoiceNo,
                             totalAmount: double.tryParse(amtCtrl.text) ?? 0,
                             paidAmount: double.tryParse(paidCtrl.text) ?? 0,
                             method: selectedMethod,
@@ -189,7 +249,8 @@ class SupplierDialogs {
                       ],
                     ),
                   ),
-                  Text("${(data['totalBalance'] ?? 0.0).toStringAsFixed(1)} ₪", style: const TextStyle(color: Colors.red, fontWeight: FontWeight.w900, fontSize: 20)),
+                  Text("${(data['totalBalance'] ?? 0.0).abs().toStringAsFixed(1)} ₪", 
+                    style: TextStyle(color: (data['totalBalance'] ?? 0.0) >= 0 ? Colors.red : Colors.green, fontWeight: FontWeight.w900, fontSize: 20)),
                 ],
               ),
             ),
@@ -206,7 +267,7 @@ class SupplierDialogs {
               title: const Text("كشف حساب المورد"),
               onTap: () { 
                 Navigator.pop(ctx); 
-                showSupplierHistory(context: context, sId: id, sName: data['name']); 
+                showSupplierHistory(context: context, sId: id, sName: data['name'], openingBalance: (data['openingBalance'] ?? 0.0).toDouble()); 
               },
             ),
             const Divider(),
@@ -249,23 +310,35 @@ class SupplierDialogs {
               children: [
                 TextField(
                   controller: amtCtrl, 
+                  onChanged: (_) => setDialogState(() {}),
                   keyboardType: const TextInputType.numberWithOptions(decimal: true), 
                   decoration: InputDecoration(labelText: "المبلغ المدفوع", prefixIcon: const Icon(Icons.money), border: OutlineInputBorder(borderRadius: BorderRadius.circular(15)))
                 ),
                 const SizedBox(height: 15),
-                StreamBuilder<DocumentSnapshot>(
-                  stream: FirebaseFirestore.instance.collection('settings').doc(cafeId).snapshots(),
+                StreamBuilder<CafeSettings>(
+                  stream: CafeService.streamCafeSettings(cafeId),
                   builder: (context, snap) {
-                    List<String> methods = ["كاش", "شبكة"];
-                    if (snap.hasData && snap.data!.exists) {
-                      methods = List<String>.from(snap.data!['paymentMethods'] ?? ["كاش", "شبكة"]);
-                      methods.removeWhere((m) => m == "دين");
+                    List<String> methods = ["كاش"];
+                    if (snap.hasData) {
+                      for (var m in snap.data!.paymentMethods) {
+                        if (!m.contains("دين") && !m.contains("ديون") && m != "كاش") {
+                          methods.add(m);
+                        }
+                      }
                     }
+                    double paidAmt = double.tryParse(amtCtrl.text) ?? 0;
+                    bool isEnabled = paidAmt > 0;
+
                     return DropdownButtonFormField<String>(
-                      value: selectedMethod,
-                      decoration: InputDecoration(labelText: "طريقة الدفع", border: OutlineInputBorder(borderRadius: BorderRadius.circular(15))),
-                      items: methods.map((m) => DropdownMenuItem(value: m, child: Text(m))).toList(),
-                      onChanged: (v) => setDialogState(() => selectedMethod = v!),
+                      value: methods.contains(selectedMethod) ? selectedMethod : methods.first,
+                      onChanged: isEnabled ? (v) => setDialogState(() => selectedMethod = v!) : null,
+                      decoration: InputDecoration(
+                        labelText: "طريقة الدفع", 
+                        border: OutlineInputBorder(borderRadius: BorderRadius.circular(15)),
+                        filled: !isEnabled,
+                        fillColor: isEnabled ? null : Colors.grey[200],
+                      ),
+                      items: methods.map((m) => DropdownMenuItem(value: m, child: Text(m, style: TextStyle(color: isEnabled ? Colors.black : Colors.grey)))).toList(),
                     );
                   }
                 ),
@@ -303,13 +376,14 @@ class SupplierDialogs {
     required BuildContext context,
     required String sId,
     required String sName,
+    double openingBalance = 0,
   }) {
     showModalBottomSheet(
       context: context,
       isScrollControlled: true,
       backgroundColor: Colors.transparent,
       builder: (ctx) => Container(
-        height: MediaQuery.of(context).size.height * 0.85,
+        height: MediaQuery.of(context).size.height * 0.9,
         decoration: const BoxDecoration(color: Colors.white, borderRadius: BorderRadius.vertical(top: Radius.circular(30))),
         child: Directionality(
           textDirection: TextDirection.rtl,
@@ -322,39 +396,130 @@ class SupplierDialogs {
                 child: Row(
                   mainAxisAlignment: MainAxisAlignment.spaceBetween,
                   children: [
-                    Text("كشف حساب: $sName", style: const TextStyle(fontSize: 18, fontWeight: FontWeight.bold)),
+                    Text("سجل حساب المورد: $sName", style: const TextStyle(fontSize: 18, fontWeight: FontWeight.bold)),
                     IconButton(onPressed: () => Navigator.pop(ctx), icon: const Icon(Icons.close)),
                   ],
                 ),
+              ),
+              const Divider(),
+              Table(
+                border: TableBorder.all(color: Colors.black45, width: 1),
+                columnWidths: const {
+                  0: FlexColumnWidth(1.2), 
+                  1: FlexColumnWidth(1.2), 
+                  2: FlexColumnWidth(1.5), 
+                  3: FlexColumnWidth(1.2), 
+                  4: FlexColumnWidth(1.2), 
+                },
+                children: [
+                  TableRow(
+                    children: [
+                      _buildHeaderCell("الرصيد المستحق للمورد (له)"),
+                      _buildHeaderCell("المبالغ المسددة (عليه)"),
+                      _buildHeaderCell("تفاصيل الحركة"),
+                      _buildHeaderCell("المبلغ الصافي"),
+                      _buildHeaderCell("تاريخ اليوم"),
+                    ],
+                  ),
+                ],
               ),
               Expanded(
                 child: StreamBuilder<QuerySnapshot>(
                   stream: FirebaseFirestore.instance.collection('supplier_transactions').where('supplierId', isEqualTo: sId).snapshots(),
                   builder: (context, snap) {
                     if (snap.connectionState == ConnectionState.waiting) return const Center(child: CircularProgressIndicator());
-                    if (!snap.hasData || snap.data!.docs.isEmpty) return const Center(child: Text("لا توجد عمليات مسجلة"));
-                    final docs = snap.data!.docs;
-                    docs.sort((a, b) => (b['date'] as Timestamp).compareTo(a['date'] as Timestamp));
+                    
+                    final docs = List.from(snap.data?.docs ?? []);
+                    docs.sort((a, b) => (a.data() as Map)['date'].compareTo((b.data() as Map)['date']));
 
-                    return ListView.separated(
-                      padding: const EdgeInsets.symmetric(horizontal: 15, vertical: 10),
-                      itemCount: docs.length,
-                      separatorBuilder: (context, i) => const Divider(height: 1),
-                      itemBuilder: (context, i) {
-                        final d = docs[i].data() as Map<String, dynamic>;
-                        final DateTime date = (d['date'] as Timestamp?)?.toDate() ?? DateTime.now();
-                        final String type = d['type'] ?? "";
-                        final bool isPayment = type.contains("سداد") || type.contains("دفعة") || (d['isPayment'] == true);
-                        
-                        return ListTile(
-                          contentPadding: const EdgeInsets.symmetric(vertical: 8, horizontal: 10),
-                          leading: CircleAvatar(
-                            backgroundColor: isPayment ? Colors.green.withOpacity(0.1) : Colors.orange.withOpacity(0.1),
-                            child: Icon(isPayment ? Icons.arrow_downward : Icons.arrow_upward, color: isPayment ? Colors.green : Colors.orange),
+                    double runningBalance = openingBalance;
+                    Map<String, List<Map<String, dynamic>>> groupedData = {};
+                    List<String> sortedDateKeys = [];
+
+                    if (openingBalance != 0) {
+                      String startKey = "رصيد سابق";
+                      groupedData[startKey] = [{
+                        'isPayment': false,
+                        'amount': openingBalance,
+                        'netBalance': openingBalance,
+                        'data': {'type': 'رصيد افتتاحي'},
+                        'time': '--:--',
+                      }];
+                      sortedDateKeys.add(startKey);
+                    }
+
+                    for (var doc in docs) {
+                      final d = doc.data() as Map<String, dynamic>;
+                      final DateTime date = (d['date'] as Timestamp?)?.toDate() ?? DateTime.now();
+                      final String dateKey = intl.DateFormat('yyyy/MM/dd').format(date);
+                      
+                      final double amt = (d['amount'] as num).toDouble();
+                      final String type = d['type'] ?? "";
+                      final bool isPayment = type.contains("سداد") || type.contains("دفعة") || (d['isPayment'] == true);
+
+                      if (isPayment) runningBalance -= amt; 
+                      else {
+                        double debtAdded = amt - (d['paid'] ?? amt).toDouble();
+                        runningBalance += debtAdded;
+                      }
+
+                      if (!groupedData.containsKey(dateKey)) {
+                        groupedData[dateKey] = [];
+                        sortedDateKeys.add(dateKey);
+                      }
+
+                      groupedData[dateKey]!.add({
+                        'data': d,
+                        'isPayment': isPayment,
+                        'amount': isPayment ? amt : (amt - (d['paid'] ?? amt).toDouble()),
+                        'netBalance': runningBalance,
+                        'time': intl.DateFormat('hh:mm a').format(date),
+                      });
+                    }
+
+                    final displayDateKeys = sortedDateKeys.reversed.toList();
+
+                    return ListView.builder(
+                      itemCount: displayDateKeys.length,
+                      padding: const EdgeInsets.only(bottom: 50),
+                      itemBuilder: (context, dateIndex) {
+                        String dateKey = displayDateKeys[dateIndex];
+                        List<Map<String, dynamic>> dayRows = groupedData[dateKey]!.reversed.toList();
+
+                        return Container(
+                          margin: const EdgeInsets.only(bottom: 15),
+                          decoration: BoxDecoration(border: Border.all(color: Colors.black, width: 1.5), borderRadius: BorderRadius.circular(4)),
+                          child: Table(
+                            border: const TableBorder(verticalInside: BorderSide(color: Colors.black, width: 1)),
+                            columnWidths: const {
+                              0: FlexColumnWidth(1.2),
+                              1: FlexColumnWidth(1.2),
+                              2: FlexColumnWidth(1.5),
+                              3: FlexColumnWidth(1.2),
+                              4: FlexColumnWidth(1.2),
+                            },
+                            children: dayRows.asMap().entries.map((entry) {
+                              int i = entry.key;
+                              var row = entry.value;
+                              final bool isPayment = row['isPayment'];
+                              final double net = row['netBalance'];
+
+                              String creditStr = !isPayment ? "${row['time']}\n${row['amount'].toStringAsFixed(1)}" : "0";
+                              String debitStr = isPayment ? "${row['time']}\n${row['amount'].toStringAsFixed(1)}" : "0";
+                              String netDisplay = net >= 0 ? "له: ${net.abs().toStringAsFixed(1)}" : "مسبق: ${net.abs().toStringAsFixed(1)}";
+
+                              return TableRow(
+                                decoration: BoxDecoration(color: i % 2 == 0 ? Colors.white : Colors.grey[50]),
+                                children: [
+                                  _buildDataCell(creditStr, color: !isPayment ? Colors.orange[800] : Colors.black),
+                                  _buildDataCell(debitStr, color: isPayment ? Colors.green[800] : Colors.black),
+                                  _buildDataCell(row['data']['type'] ?? "-", isSmall: true),
+                                  _buildDataCell(netDisplay, fontWeight: FontWeight.bold, color: net >= 0 ? Colors.red[900] : Colors.green[900]),
+                                  _buildDataCell(i == 0 ? dateKey : ""),
+                                ],
+                              );
+                            }).toList(),
                           ),
-                          title: Text(type, style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 14)),
-                          subtitle: Text("${intl.DateFormat('yyyy/MM/dd | hh:mm a').format(date)} | ${d['method'] ?? 'كاش'}", style: const TextStyle(fontSize: 11, color: Colors.grey)),
-                          trailing: Text("${d['amount']} ₪", style: TextStyle(fontWeight: FontWeight.w900, color: isPayment ? Colors.green : Colors.black, fontSize: 16)),
                         );
                       },
                     );
@@ -368,11 +533,29 @@ class SupplierDialogs {
     );
   }
 
-  static Widget _popInput(TextEditingController ctrl, String label, IconData icon, {bool isNum = false}) {
+  static Widget _buildHeaderCell(String text) => Container(
+    height: 50, alignment: Alignment.center, padding: const EdgeInsets.all(4.0),
+    child: Text(text, textAlign: TextAlign.center, style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 10)),
+  );
+
+  static Widget _buildDataCell(String text, {Color? color, FontWeight? fontWeight, bool isSmall = false}) => Container(
+    height: 45, alignment: Alignment.center, padding: const EdgeInsets.all(6.0),
+    child: Text(text, textAlign: TextAlign.center, style: TextStyle(color: color, fontWeight: fontWeight, fontSize: isSmall ? 9 : 11)),
+  );
+
+  static Widget _popInput(TextEditingController ctrl, String label, IconData icon, {bool isNum = false, bool isReadOnly = false, Function(String)? onChanged}) {
     return TextField(
       controller: ctrl,
+      onChanged: onChanged,
+      readOnly: isReadOnly,
       keyboardType: isNum ? const TextInputType.numberWithOptions(decimal: true) : TextInputType.text,
-      decoration: InputDecoration(labelText: label, prefixIcon: Icon(icon, size: 20), filled: true, fillColor: Colors.grey[50], border: OutlineInputBorder(borderRadius: BorderRadius.circular(15), borderSide: BorderSide.none)),
+      decoration: InputDecoration(
+        labelText: label, 
+        prefixIcon: Icon(icon, size: 20), 
+        filled: true, 
+        fillColor: isReadOnly ? Colors.grey[200] : Colors.grey[50], 
+        border: OutlineInputBorder(borderRadius: BorderRadius.circular(15), borderSide: BorderSide.none)
+      ),
     );
   }
 }
