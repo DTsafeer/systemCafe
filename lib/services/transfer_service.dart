@@ -2,6 +2,7 @@ import 'package:cloud_firestore/cloud_firestore.dart';
 import 'package:flutter/material.dart';
 import '../pages/user_model.dart';
 import '../pages/activity_logger.dart';
+import 'account_service.dart';
 
 class TransferService {
   static Future<void> syncWithDebts({
@@ -97,47 +98,6 @@ class TransferService {
     }
   }
 
-  static Future<void> togglePendingStatus({
-    required DocumentSnapshot doc,
-    required User currentUser,
-  }) async {
-    final data = doc.data() as Map;
-    final bool currentPending = data['is_pending'] ?? false;
-    final bool isDebtRef = data['payment_method'].toString().contains("دين") || (data['is_debt_payment'] ?? false);
-    final String customerName = data['customer_name'] ?? "";
-    final double amount = (data['total_amount'] ?? 0.0).toDouble();
-    final String cafeId = data['cafeId'] ?? "";
-
-    // 1. تحديث حالة التعليق
-    await doc.reference.update({'is_pending': !currentPending});
-
-    // 2. إذا كانت مرتبطة بالديون، نقوم بتعديل الرصيد تلقائياً
-    if (isDebtRef && customerName != "زبون عام") {
-      // إذا كانت العملية ستصبح "معلقة" (كانت نشطة): نسحب المبلغ من رصيد المدفوعات (نزيد الدين)
-      // إذا كانت العملية ستصبح "نشطة" (كانت معلقة): نعيد تسجيل الدفعة (نقلل الدين)
-      await syncWithDebts(
-        currentUser: currentUser,
-        customerInput: customerName,
-        phone: data['customer_phone'] ?? "",
-        amount: currentPending ? amount : 0, // إذا كانت معلقة والآن نفعلها، نرسل المبلغ. إذا كانت نشطة ونعلقها، نرسل 0 مع oldAmount
-        oldAmount: currentPending ? 0 : amount,
-        cafeId: cafeId,
-        isAddingDebt: false, // دائماً تعامل كدفعة (سداد) يتم عكسها أو تفعيلها
-        type: currentPending ? "تفعيل حوالة معلقة" : "تعليق حوالة (مراجعة)",
-        note: "تعديل تلقائي بسبب تغيير حالة الحوالة إلى ${currentPending ? 'نشطة' : 'معلقة'}",
-      );
-    }
-
-    await ActivityLogger.log(
-      cafeId: cafeId,
-      parentId: currentUser.parentId ?? currentUser.id,
-      userId: currentUser.id,
-      userName: currentUser.name,
-      action: "حوالات - تغيير حالة",
-      details: "تحويل حالة حوالة الزبون $customerName بقيمة $amount إلى ${currentPending ? 'نشطة' : 'معلقة'}",
-    );
-  }
-
   static Future<void> performSave({
     required BuildContext context,
     DocumentSnapshot? editDoc,
@@ -166,6 +126,8 @@ class TransferService {
     bool shouldSaveToPayments = !method.contains("دين") && !method.contains("ديون");
     if (isDebtPayment) shouldSaveToPayments = true; 
 
+    final batch = FirebaseFirestore.instance.batch();
+
     final data = {
       'customer_name': customerName,
       'payer_name': payerName,
@@ -191,11 +153,24 @@ class TransferService {
       'proof_url': proofImageUrl,
     };
 
-    if (!isUpdate && !skipPaymentRecord && shouldSaveToPayments) {
-      await FirebaseFirestore.instance.collection('payments').add(data);
-    } else if (isUpdate) {
-      await editDoc.reference.update(data);
+    // 1. تحديث رصيد الخزينة (زيادة عند البيع أو سداد الديون)
+    if (!isUpdate && shouldSaveToPayments && amt > 0) {
+      await AccountService.updateBalance(
+        cafeId: cafeId, 
+        method: method, 
+        amount: amt, 
+        batch: batch
+      );
     }
+
+    if (!isUpdate && !skipPaymentRecord && shouldSaveToPayments) {
+      final newDocRef = FirebaseFirestore.instance.collection('payments').doc();
+      batch.set(newDocRef, data);
+    } else if (isUpdate) {
+      batch.update(editDoc.reference, data);
+    }
+
+    await batch.commit();
 
     if (!skipSync && (isDebtPayment || method.contains("دين") || method.contains("ديون"))) {
       await syncWithDebts(
@@ -231,6 +206,20 @@ class TransferService {
     final data = doc.data() as Map;
     final String cafeId = data['cafeId'] ?? activeCafeId ?? "";
     final String managerId = currentUser.parentId ?? currentUser.id;
+    final String method = data['payment_method'] ?? "كاش";
+    final double amount = (data['total_amount'] ?? 0).toDouble();
+
+    final batch = FirebaseFirestore.instance.batch();
+
+    // عكس رصيد الخزينة عند الحذف (خصم)
+    if (amount > 0 && !method.contains("دين")) {
+      await AccountService.updateBalance(
+        cafeId: cafeId, 
+        method: method, 
+        amount: -amount, 
+        batch: batch
+      );
+    }
 
     if ((data['is_received'] == true || data['is_debt_payment'] == true || data['payment_method'].toString().contains("دين")) &&
         data['customer_name'] != "زبون عام" && (data['is_pending'] != true)) {
@@ -239,7 +228,7 @@ class TransferService {
         customerInput: data['customer_name'] ?? "",
         phone: data['customer_phone'] ?? "",
         amount: 0,
-        oldAmount: (data['total_amount'] ?? 0).toDouble(),
+        oldAmount: amount,
         cafeId: cafeId,
         isAddingDebt: data['payment_method'].toString().contains("دين") && data['is_debt_payment'] != true,
         type: "حذف عملية",
@@ -252,9 +241,10 @@ class TransferService {
       userId: currentUser.id,
       userName: currentUser.name,
       action: "حوالات - حذف",
-      details: "حذف عملية بقيمة ${data['total_amount']} ₪ للزبون ${data['customer_name']}",
+      details: "حذف عملية بقيمة $amount ₪ للزبون ${data['customer_name']}",
     );
 
-    await doc.reference.delete();
+    batch.delete(doc.reference);
+    await batch.commit();
   }
 }

@@ -161,6 +161,7 @@ class _SuppliersPageState extends State<SuppliersPage> with SingleTickerProvider
           return Column(
             children: [
               _buildStatDashboard(primaryColor, allDocs),
+              _buildTreasuryBar(primaryColor), // إضافة شريط أرصدة الخزينة
               _buildSearchAndSortBar(filteredDocs),
               _buildFilterChips(allDocs),
               _buildCustomTabBar(primaryColor),
@@ -193,7 +194,7 @@ class _SuppliersPageState extends State<SuppliersPage> with SingleTickerProvider
     }
 
     return Container(
-      padding: const EdgeInsets.fromLTRB(20, 30, 20, 25),
+      padding: const EdgeInsets.fromLTRB(20, 30, 20, 15),
       decoration: BoxDecoration(
         gradient: LinearGradient(colors: [primary, primary.withBlue(100)]),
         borderRadius: const BorderRadius.vertical(bottom: Radius.circular(35)),
@@ -220,6 +221,49 @@ class _SuppliersPageState extends State<SuppliersPage> with SingleTickerProvider
           )
         ],
       ),
+    );
+  }
+
+  Widget _buildTreasuryBar(Color primary) {
+    return StreamBuilder<QuerySnapshot>(
+      stream: FirebaseFirestore.instance.collection('cafes').doc(_cafeId).collection('accounts').snapshots(),
+      builder: (context, snap) {
+        if (!snap.hasData) return const SizedBox.shrink();
+        final docs = snap.data!.docs;
+        if (docs.isEmpty) return const SizedBox.shrink();
+
+        return Container(
+          height: 65,
+          margin: const EdgeInsets.only(top: 10),
+          child: ListView.builder(
+            scrollDirection: Axis.horizontal,
+            padding: const EdgeInsets.symmetric(horizontal: 16),
+            itemCount: docs.length,
+            itemBuilder: (context, i) {
+              final d = docs[i].data() as Map<String, dynamic>;
+              double balance = (d['balance'] ?? 0.0).toDouble();
+              return Container(
+                margin: const EdgeInsets.only(left: 10),
+                padding: const EdgeInsets.symmetric(horizontal: 15, vertical: 8),
+                decoration: BoxDecoration(
+                  color: Colors.white,
+                  borderRadius: BorderRadius.circular(15),
+                  border: Border.all(color: primary.withOpacity(0.2)),
+                  boxShadow: [BoxShadow(color: Colors.black.withOpacity(0.03), blurRadius: 5)]
+                ),
+                child: Column(
+                  mainAxisAlignment: MainAxisAlignment.center,
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Text(d['methodName'] ?? "حساب", style: const TextStyle(fontSize: 10, color: Colors.grey, fontWeight: FontWeight.bold)),
+                    Text("${balance.toStringAsFixed(1)} ₪", style: TextStyle(fontSize: 14, fontWeight: FontWeight.w900, color: balance > 0 ? Colors.green[800] : Colors.red[800])),
+                  ],
+                ),
+              );
+            },
+          ),
+        );
+      },
     );
   }
 

@@ -4,6 +4,7 @@ import 'package:cloud_firestore/cloud_firestore.dart';
 import 'package:intl/intl.dart' as intl;
 import '../services/supplier_service.dart';
 import '../services/cafe_service.dart';
+import '../services/account_service.dart';
 import '../pages/user_model.dart';
 
 class SupplierDialogs {
@@ -74,7 +75,6 @@ class SupplierDialogs {
     required String managerId,
     String? initialSupplierId,
   }) {
-    // توليد رقم فاتورة من 6 خانات (5 أرقام وحرف واحد)
     final random = Random();
     const letters = 'ABCDEFGHJKLMNPQRSTUVWXYZ';
     const digits = '0123456789';
@@ -84,10 +84,11 @@ class SupplierDialogs {
     final String autoInvoiceNo = chars.join();
     
     final amtCtrl = TextEditingController(), paidCtrl = TextEditingController();
-          
     String? selectedSupplierId = initialSupplierId;
     String? selectedSupplierName;
     String selectedMethod = "كاش";
+    bool isLoading = false;
+    double currentMethodBalance = 0.0;
     
     showDialog(
       context: context,
@@ -104,25 +105,14 @@ class SupplierDialogs {
                   const Text("تسجيل فاتورة مشتريات", style: TextStyle(fontSize: 20, fontWeight: FontWeight.bold)),
                   const SizedBox(height: 25),
                   
-                  // صندوق عرض رقم الفاتورة (للمشاهدة فقط)
                   Container(
                     width: double.infinity,
                     padding: const EdgeInsets.symmetric(vertical: 12, horizontal: 15),
-                    decoration: BoxDecoration(
-                      color: Colors.blueGrey[50],
-                      borderRadius: BorderRadius.circular(15),
-                      border: Border.all(color: Colors.blueGrey[100]!),
-                    ),
+                    decoration: BoxDecoration(color: Colors.blueGrey[50], borderRadius: BorderRadius.circular(15), border: Border.all(color: Colors.blueGrey[100]!)),
                     child: Row(
                       mainAxisAlignment: MainAxisAlignment.spaceBetween,
                       children: [
-                        const Row(
-                          children: [
-                            Icon(Icons.tag, color: Colors.blueGrey, size: 18),
-                            SizedBox(width: 8),
-                            Text("رقم الفاتورة الآلي:", style: TextStyle(color: Colors.blueGrey, fontSize: 13, fontWeight: FontWeight.bold)),
-                          ],
-                        ),
+                        const Row(children: [Icon(Icons.tag, color: Colors.blueGrey, size: 18), SizedBox(width: 8), Text("رقم الفاتورة الآلي:", style: TextStyle(color: Colors.blueGrey, fontSize: 13, fontWeight: FontWeight.bold))]),
                         Text(autoInvoiceNo, style: const TextStyle(fontWeight: FontWeight.w900, color: Colors.black, fontSize: 16, letterSpacing: 1.5)),
                       ],
                     ),
@@ -135,9 +125,7 @@ class SupplierDialogs {
                       if (!snap.hasData) return const CircularProgressIndicator();
                       final suppliers = snap.data!;
                       if (selectedSupplierId != null && selectedSupplierName == null) {
-                        try {
-                          selectedSupplierName = suppliers.firstWhere((s) => s['id'] == selectedSupplierId)['name'];
-                        } catch(_) {}
+                        try { selectedSupplierName = suppliers.firstWhere((s) => s['id'] == selectedSupplierId)['name']; } catch(_) {}
                       }
 
                       return DropdownButtonFormField<String>(
@@ -147,10 +135,7 @@ class SupplierDialogs {
                         items: suppliers.map((s) => DropdownMenuItem(value: s['id'].toString(), child: Text(s['name']))).toList(),
                         onChanged: (v) { 
                           final s = suppliers.firstWhere((s) => s['id'] == v); 
-                          setDialogState(() {
-                            selectedSupplierId = v; 
-                            selectedSupplierName = s['name']; 
-                          });
+                          setDialogState(() { selectedSupplierId = v; selectedSupplierName = s['name']; });
                         },
                       );
                     },
@@ -160,57 +145,205 @@ class SupplierDialogs {
                   const SizedBox(height: 12),
                   _popInput(paidCtrl, "المبلغ المسدد الآن", Icons.payments_outlined, isNum: true, onChanged: (_) => setDialogState(() {})),
                   const SizedBox(height: 12),
+                  
+                  // طريقة الدفع مع عرض الرصيد
                   StreamBuilder<CafeSettings>(
                     stream: CafeService.streamCafeSettings(cafeId),
                     builder: (context, snap) {
                       List<String> methods = ["كاش"];
                       if (snap.hasData) {
                         for (var m in snap.data!.paymentMethods) {
-                          if (!m.contains("دين") && !m.contains("ديون") && m != "كاش") {
-                            methods.add(m);
-                          }
+                          if (!m.contains("دين") && !m.contains("ديون") && m != "كاش") methods.add(m);
                         }
                       }
                       double paidVal = double.tryParse(paidCtrl.text) ?? 0;
                       bool isEnabled = paidVal > 0;
 
-                      return DropdownButtonFormField<String>(
-                        value: methods.contains(selectedMethod) ? selectedMethod : methods.first,
-                        onChanged: isEnabled ? (v) => setDialogState(() => selectedMethod = v!) : null,
-                        decoration: InputDecoration(
-                          labelText: "طريقة الدفع", 
-                          filled: true, 
-                          fillColor: isEnabled ? Colors.grey[50] : Colors.grey[200],
-                          border: OutlineInputBorder(borderRadius: BorderRadius.circular(15), borderSide: BorderSide.none)
-                        ),
-                        items: methods.map((m) => DropdownMenuItem(value: m, child: Text(m, style: TextStyle(color: isEnabled ? Colors.black : Colors.grey)))).toList(),
+                      return Column(
+                        crossAxisAlignment: CrossAxisAlignment.start,
+                        children: [
+                          DropdownButtonFormField<String>(
+                            value: methods.contains(selectedMethod) ? selectedMethod : methods.first,
+                            onChanged: isEnabled ? (v) async {
+                              double bal = await AccountService.getMethodBalance(cafeId, v!);
+                              setDialogState(() { 
+                                selectedMethod = v; 
+                                currentMethodBalance = bal;
+                              });
+                            } : null,
+                            decoration: InputDecoration(
+                              labelText: "طريقة الدفع", 
+                              filled: true, 
+                              fillColor: isEnabled ? Colors.grey[50] : Colors.grey[200],
+                              border: OutlineInputBorder(borderRadius: BorderRadius.circular(15), borderSide: BorderSide.none)
+                            ),
+                            items: methods.map((m) => DropdownMenuItem(value: m, child: Text(m, style: TextStyle(color: isEnabled ? Colors.black : Colors.grey)))).toList(),
+                          ),
+                          if (isEnabled)
+                            FutureBuilder<double>(
+                              future: AccountService.getMethodBalance(cafeId, selectedMethod),
+                              builder: (context, balSnap) {
+                                double bal = balSnap.data ?? 0.0;
+                                bool enough = bal >= paidVal;
+                                return Padding(
+                                  padding: const EdgeInsets.only(top: 8, right: 10),
+                                  child: Text(
+                                    "الرصيد المتوفر في $selectedMethod: ${bal.toStringAsFixed(1)} ₪",
+                                    style: TextStyle(fontSize: 12, fontWeight: FontWeight.bold, color: enough ? Colors.green[700] : Colors.red),
+                                  ),
+                                );
+                              }
+                            ),
+                        ],
                       );
                     }
                   ),
                   const SizedBox(height: 30),
                   ElevatedButton(
                     style: ElevatedButton.styleFrom(backgroundColor: Colors.orange[800], minimumSize: const Size(double.infinity, 55), shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(15))),
-                    onPressed: () { 
+                    onPressed: isLoading ? null : () async { 
                        if (selectedSupplierId != null && amtCtrl.text.isNotEmpty) {
-                          SupplierService.savePurchaseBill(
-                            supplierId: selectedSupplierId!,
-                            supplierName: selectedSupplierName!,
-                            invoiceNo: autoInvoiceNo,
-                            totalAmount: double.tryParse(amtCtrl.text) ?? 0,
-                            paidAmount: double.tryParse(paidCtrl.text) ?? 0,
-                            method: selectedMethod,
-                            currentUser: currentUser,
-                            cafeId: cafeId,
-                            managerId: managerId,
-                          );
-                          Navigator.pop(ctx); 
+                          setDialogState(() => isLoading = true);
+                          try {
+                            await SupplierService.savePurchaseBill(
+                              supplierId: selectedSupplierId!,
+                              supplierName: selectedSupplierName!,
+                              invoiceNo: autoInvoiceNo,
+                              totalAmount: double.tryParse(amtCtrl.text) ?? 0,
+                              paidAmount: double.tryParse(paidCtrl.text) ?? 0,
+                              method: selectedMethod,
+                              currentUser: currentUser,
+                              cafeId: cafeId,
+                              managerId: managerId,
+                            );
+                            if (context.mounted) Navigator.pop(ctx); 
+                          } catch (e) {
+                            setDialogState(() => isLoading = false);
+                            if (context.mounted) {
+                              ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(e.toString().replaceAll("Exception: ", "")), backgroundColor: Colors.red));
+                            }
+                          }
                        }
                     },
-                    child: const Text("تأكيد وحفظ الفاتورة", style: TextStyle(color: Colors.white, fontWeight: FontWeight.bold)),
+                    child: isLoading ? const CircularProgressIndicator(color: Colors.white) : const Text("تأكيد وحفظ الفاتورة", style: TextStyle(color: Colors.white, fontWeight: FontWeight.bold)),
                   )
                 ],
               ),
             ),
+          ),
+        ),
+      ),
+    );
+  }
+
+  static void showPaySupplierDialog({
+    required BuildContext context,
+    required String sId,
+    required String sName,
+    required User currentUser,
+    required String cafeId,
+    required String managerId,
+  }) {
+    final amtCtrl = TextEditingController();
+    String selectedMethod = "كاش";
+    bool isLoading = false;
+
+    showDialog(
+      context: context,
+      builder: (ctx) => StatefulBuilder(
+        builder: (context, setDialogState) => Directionality(
+          textDirection: TextDirection.rtl,
+          child: AlertDialog(
+            shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(25)),
+            title: Text("تسديد دفعة لـ $sName"),
+            content: Column(
+              mainAxisSize: MainAxisSize.min,
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                TextField(
+                  controller: amtCtrl, 
+                  onChanged: (_) => setDialogState(() {}),
+                  keyboardType: const TextInputType.numberWithOptions(decimal: true), 
+                  decoration: InputDecoration(labelText: "المبلغ المدفوع", prefixIcon: const Icon(Icons.money), border: OutlineInputBorder(borderRadius: BorderRadius.circular(15)))
+                ),
+                const SizedBox(height: 15),
+                StreamBuilder<CafeSettings>(
+                  stream: CafeService.streamCafeSettings(cafeId),
+                  builder: (context, snap) {
+                    List<String> methods = ["كاش"];
+                    if (snap.hasData) {
+                      for (var m in snap.data!.paymentMethods) {
+                        if (!m.contains("دين") && !m.contains("ديون") && m != "كاش") methods.add(m);
+                      }
+                    }
+                    double paidAmt = double.tryParse(amtCtrl.text) ?? 0;
+                    bool isEnabled = paidAmt > 0;
+
+                    return Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        DropdownButtonFormField<String>(
+                          value: methods.contains(selectedMethod) ? selectedMethod : methods.first,
+                          onChanged: isEnabled ? (v) => setDialogState(() => selectedMethod = v!) : null,
+                          decoration: InputDecoration(
+                            labelText: "طريقة الدفع", 
+                            border: OutlineInputBorder(borderRadius: BorderRadius.circular(15)),
+                            filled: !isEnabled,
+                            fillColor: isEnabled ? null : Colors.grey[200],
+                          ),
+                          items: methods.map((m) => DropdownMenuItem(value: m, child: Text(m, style: TextStyle(color: isEnabled ? Colors.black : Colors.grey)))).toList(),
+                        ),
+                        if (isEnabled)
+                          FutureBuilder<double>(
+                            future: AccountService.getMethodBalance(cafeId, selectedMethod),
+                            builder: (context, balSnap) {
+                              double bal = balSnap.data ?? 0.0;
+                              bool enough = bal >= paidAmt;
+                              return Padding(
+                                padding: const EdgeInsets.only(top: 8, right: 5),
+                                child: Text(
+                                  "الرصيد المتوفر: ${bal.toStringAsFixed(1)} ₪",
+                                  style: TextStyle(fontSize: 12, fontWeight: FontWeight.bold, color: enough ? Colors.green[700] : Colors.red),
+                                ),
+                              );
+                            }
+                          ),
+                      ],
+                    );
+                  }
+                ),
+              ],
+            ),
+            actions: [
+              TextButton(onPressed: isLoading ? null : () => Navigator.pop(ctx), child: const Text("إلغاء")),
+              ElevatedButton(
+                style: ElevatedButton.styleFrom(backgroundColor: Colors.green, shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(10))),
+                onPressed: isLoading ? null : () async {
+                  double amt = double.tryParse(amtCtrl.text) ?? 0;
+                  if (amt > 0) {
+                    setDialogState(() => isLoading = true);
+                    try {
+                      await SupplierService.processSupplierPayment(
+                        supplierId: sId,
+                        supplierName: sName,
+                        amount: amt,
+                        method: selectedMethod,
+                        currentUser: currentUser,
+                        cafeId: cafeId,
+                        managerId: managerId,
+                      );
+                      if (context.mounted) Navigator.pop(ctx);
+                    } catch (e) {
+                      setDialogState(() => isLoading = false);
+                      if (context.mounted) {
+                        ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(e.toString().replaceAll("Exception: ", "")), backgroundColor: Colors.red));
+                      }
+                    }
+                  }
+                }, 
+                child: isLoading ? const SizedBox(width: 20, height: 20, child: CircularProgressIndicator(color: Colors.white, strokeWidth: 2)) : const Text("تأكيد الدفع", style: TextStyle(color: Colors.white))
+              )
+            ],
           ),
         ),
       ),
@@ -286,92 +419,6 @@ class SupplierDialogs {
     );
   }
 
-  static void showPaySupplierDialog({
-    required BuildContext context,
-    required String sId,
-    required String sName,
-    required User currentUser,
-    required String cafeId,
-    required String managerId,
-  }) {
-    final amtCtrl = TextEditingController();
-    String selectedMethod = "كاش";
-
-    showDialog(
-      context: context,
-      builder: (ctx) => StatefulBuilder(
-        builder: (context, setDialogState) => Directionality(
-          textDirection: TextDirection.rtl,
-          child: AlertDialog(
-            shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(25)),
-            title: Text("تسديد دفعة لـ $sName"),
-            content: Column(
-              mainAxisSize: MainAxisSize.min,
-              children: [
-                TextField(
-                  controller: amtCtrl, 
-                  onChanged: (_) => setDialogState(() {}),
-                  keyboardType: const TextInputType.numberWithOptions(decimal: true), 
-                  decoration: InputDecoration(labelText: "المبلغ المدفوع", prefixIcon: const Icon(Icons.money), border: OutlineInputBorder(borderRadius: BorderRadius.circular(15)))
-                ),
-                const SizedBox(height: 15),
-                StreamBuilder<CafeSettings>(
-                  stream: CafeService.streamCafeSettings(cafeId),
-                  builder: (context, snap) {
-                    List<String> methods = ["كاش"];
-                    if (snap.hasData) {
-                      for (var m in snap.data!.paymentMethods) {
-                        if (!m.contains("دين") && !m.contains("ديون") && m != "كاش") {
-                          methods.add(m);
-                        }
-                      }
-                    }
-                    double paidAmt = double.tryParse(amtCtrl.text) ?? 0;
-                    bool isEnabled = paidAmt > 0;
-
-                    return DropdownButtonFormField<String>(
-                      value: methods.contains(selectedMethod) ? selectedMethod : methods.first,
-                      onChanged: isEnabled ? (v) => setDialogState(() => selectedMethod = v!) : null,
-                      decoration: InputDecoration(
-                        labelText: "طريقة الدفع", 
-                        border: OutlineInputBorder(borderRadius: BorderRadius.circular(15)),
-                        filled: !isEnabled,
-                        fillColor: isEnabled ? null : Colors.grey[200],
-                      ),
-                      items: methods.map((m) => DropdownMenuItem(value: m, child: Text(m, style: TextStyle(color: isEnabled ? Colors.black : Colors.grey)))).toList(),
-                    );
-                  }
-                ),
-              ],
-            ),
-            actions: [
-              TextButton(onPressed: () => Navigator.pop(ctx), child: const Text("إلغاء")),
-              ElevatedButton(
-                style: ElevatedButton.styleFrom(backgroundColor: Colors.green, shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(10))),
-                onPressed: () {
-                  double amt = double.tryParse(amtCtrl.text) ?? 0;
-                  if (amt > 0) {
-                    SupplierService.processSupplierPayment(
-                      supplierId: sId,
-                      supplierName: sName,
-                      amount: amt,
-                      method: selectedMethod,
-                      currentUser: currentUser,
-                      cafeId: cafeId,
-                      managerId: managerId,
-                    );
-                  }
-                  Navigator.pop(ctx);
-                }, 
-                child: const Text("تأكيد الدفع", style: TextStyle(color: Colors.white))
-              )
-            ],
-          ),
-        ),
-      ),
-    );
-  }
-
   static void showSupplierHistory({
     required BuildContext context,
     required String sId,
@@ -404,23 +451,9 @@ class SupplierDialogs {
               const Divider(),
               Table(
                 border: TableBorder.all(color: Colors.black45, width: 1),
-                columnWidths: const {
-                  0: FlexColumnWidth(1.2), 
-                  1: FlexColumnWidth(1.2), 
-                  2: FlexColumnWidth(1.5), 
-                  3: FlexColumnWidth(1.2), 
-                  4: FlexColumnWidth(1.2), 
-                },
+                columnWidths: const { 0: FlexColumnWidth(1.2), 1: FlexColumnWidth(1.2), 2: FlexColumnWidth(1.5), 3: FlexColumnWidth(1.2), 4: FlexColumnWidth(1.2) },
                 children: [
-                  TableRow(
-                    children: [
-                      _buildHeaderCell("الرصيد المستحق للمورد (له)"),
-                      _buildHeaderCell("المبالغ المسددة (عليه)"),
-                      _buildHeaderCell("تفاصيل الحركة"),
-                      _buildHeaderCell("المبلغ الصافي"),
-                      _buildHeaderCell("تاريخ اليوم"),
-                    ],
-                  ),
+                  TableRow(children: [_buildHeaderCell("الرصيد المستحق للمورد (له)"), _buildHeaderCell("المبالغ المسددة (عليه)"), _buildHeaderCell("تفاصيل الحركة"), _buildHeaderCell("المبلغ الصافي"), _buildHeaderCell("تاريخ اليوم")]),
                 ],
               ),
               Expanded(
@@ -428,7 +461,6 @@ class SupplierDialogs {
                   stream: FirebaseFirestore.instance.collection('supplier_transactions').where('supplierId', isEqualTo: sId).snapshots(),
                   builder: (context, snap) {
                     if (snap.connectionState == ConnectionState.waiting) return const Center(child: CircularProgressIndicator());
-                    
                     final docs = List.from(snap.data?.docs ?? []);
                     docs.sort((a, b) => (a.data() as Map)['date'].compareTo((b.data() as Map)['date']));
 
@@ -438,13 +470,7 @@ class SupplierDialogs {
 
                     if (openingBalance != 0) {
                       String startKey = "رصيد سابق";
-                      groupedData[startKey] = [{
-                        'isPayment': false,
-                        'amount': openingBalance,
-                        'netBalance': openingBalance,
-                        'data': {'type': 'رصيد افتتاحي'},
-                        'time': '--:--',
-                      }];
+                      groupedData[startKey] = [{'isPayment': false, 'amount': openingBalance, 'netBalance': openingBalance, 'data': {'type': 'رصيد افتتاحي'}, 'time': '--:--'}];
                       sortedDateKeys.add(startKey);
                     }
 
@@ -452,71 +478,41 @@ class SupplierDialogs {
                       final d = doc.data() as Map<String, dynamic>;
                       final DateTime date = (d['date'] as Timestamp?)?.toDate() ?? DateTime.now();
                       final String dateKey = intl.DateFormat('yyyy/MM/dd').format(date);
-                      
                       final double amt = (d['amount'] as num).toDouble();
                       final String type = d['type'] ?? "";
                       final bool isPayment = type.contains("سداد") || type.contains("دفعة") || (d['isPayment'] == true);
 
                       if (isPayment) runningBalance -= amt; 
-                      else {
-                        double debtAdded = amt - (d['paid'] ?? amt).toDouble();
-                        runningBalance += debtAdded;
-                      }
+                      else { runningBalance += (amt - (d['paid'] ?? amt).toDouble()); }
 
-                      if (!groupedData.containsKey(dateKey)) {
-                        groupedData[dateKey] = [];
-                        sortedDateKeys.add(dateKey);
-                      }
-
-                      groupedData[dateKey]!.add({
-                        'data': d,
-                        'isPayment': isPayment,
-                        'amount': isPayment ? amt : (amt - (d['paid'] ?? amt).toDouble()),
-                        'netBalance': runningBalance,
-                        'time': intl.DateFormat('hh:mm a').format(date),
-                      });
+                      if (!groupedData.containsKey(dateKey)) { groupedData[dateKey] = []; sortedDateKeys.add(dateKey); }
+                      groupedData[dateKey]!.add({ 'data': d, 'isPayment': isPayment, 'amount': isPayment ? amt : (amt - (d['paid'] ?? amt).toDouble()), 'netBalance': runningBalance, 'time': intl.DateFormat('hh:mm a').format(date) });
                     }
 
                     final displayDateKeys = sortedDateKeys.reversed.toList();
-
                     return ListView.builder(
                       itemCount: displayDateKeys.length,
                       padding: const EdgeInsets.only(bottom: 50),
                       itemBuilder: (context, dateIndex) {
                         String dateKey = displayDateKeys[dateIndex];
                         List<Map<String, dynamic>> dayRows = groupedData[dateKey]!.reversed.toList();
-
                         return Container(
                           margin: const EdgeInsets.only(bottom: 15),
                           decoration: BoxDecoration(border: Border.all(color: Colors.black, width: 1.5), borderRadius: BorderRadius.circular(4)),
                           child: Table(
                             border: const TableBorder(verticalInside: BorderSide(color: Colors.black, width: 1)),
-                            columnWidths: const {
-                              0: FlexColumnWidth(1.2),
-                              1: FlexColumnWidth(1.2),
-                              2: FlexColumnWidth(1.5),
-                              3: FlexColumnWidth(1.2),
-                              4: FlexColumnWidth(1.2),
-                            },
+                            columnWidths: const { 0: FlexColumnWidth(1.2), 1: FlexColumnWidth(1.2), 2: FlexColumnWidth(1.5), 3: FlexColumnWidth(1.2), 4: FlexColumnWidth(1.2) },
                             children: dayRows.asMap().entries.map((entry) {
                               int i = entry.key;
                               var row = entry.value;
                               final bool isPayment = row['isPayment'];
                               final double net = row['netBalance'];
-
                               String creditStr = !isPayment ? "${row['time']}\n${row['amount'].toStringAsFixed(1)}" : "0";
                               String debitStr = isPayment ? "${row['time']}\n${row['amount'].toStringAsFixed(1)}" : "0";
                               String netDisplay = net >= 0 ? "له: ${net.abs().toStringAsFixed(1)}" : "مسبق: ${net.abs().toStringAsFixed(1)}";
-
                               return TableRow(
                                 decoration: BoxDecoration(color: i % 2 == 0 ? Colors.white : Colors.grey[50]),
-                                children: [
-                                  _buildDataCell(creditStr, color: !isPayment ? Colors.orange[800] : Colors.black),
-                                  _buildDataCell(debitStr, color: isPayment ? Colors.green[800] : Colors.black),
-                                  _buildDataCell(row['data']['type'] ?? "-", isSmall: true),
-                                  _buildDataCell(netDisplay, fontWeight: FontWeight.bold, color: net >= 0 ? Colors.red[900] : Colors.green[900]),
-                                  _buildDataCell(i == 0 ? dateKey : ""),
-                                ],
+                                children: [ _buildDataCell(creditStr, color: !isPayment ? Colors.orange[800] : Colors.black), _buildDataCell(debitStr, color: isPayment ? Colors.green[800] : Colors.black), _buildDataCell(row['data']['type'] ?? "-", isSmall: true), _buildDataCell(netDisplay, fontWeight: FontWeight.bold, color: net >= 0 ? Colors.red[900] : Colors.green[900]), _buildDataCell(i == 0 ? dateKey : "") ],
                               );
                             }).toList(),
                           ),
@@ -533,15 +529,8 @@ class SupplierDialogs {
     );
   }
 
-  static Widget _buildHeaderCell(String text) => Container(
-    height: 50, alignment: Alignment.center, padding: const EdgeInsets.all(4.0),
-    child: Text(text, textAlign: TextAlign.center, style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 10)),
-  );
-
-  static Widget _buildDataCell(String text, {Color? color, FontWeight? fontWeight, bool isSmall = false}) => Container(
-    height: 45, alignment: Alignment.center, padding: const EdgeInsets.all(6.0),
-    child: Text(text, textAlign: TextAlign.center, style: TextStyle(color: color, fontWeight: fontWeight, fontSize: isSmall ? 9 : 11)),
-  );
+  static Widget _buildHeaderCell(String text) => Container(height: 50, alignment: Alignment.center, padding: const EdgeInsets.all(4.0), child: Text(text, textAlign: TextAlign.center, style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 10)));
+  static Widget _buildDataCell(String text, {Color? color, FontWeight? fontWeight, bool isSmall = false}) => Container(height: 45, alignment: Alignment.center, padding: const EdgeInsets.all(6.0), child: Text(text, textAlign: TextAlign.center, style: TextStyle(color: color, fontWeight: fontWeight, fontSize: isSmall ? 9 : 11)));
 
   static Widget _popInput(TextEditingController ctrl, String label, IconData icon, {bool isNum = false, bool isReadOnly = false, Function(String)? onChanged}) {
     return TextField(

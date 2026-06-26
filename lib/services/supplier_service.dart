@@ -1,6 +1,7 @@
 import 'package:cloud_firestore/cloud_firestore.dart';
 import '../pages/user_model.dart';
 import '../pages/activity_logger.dart';
+import 'account_service.dart';
 
 class SupplierService {
   static final FirebaseFirestore _db = FirebaseFirestore.instance;
@@ -48,10 +49,17 @@ class SupplierService {
     required String cafeId,
     required String managerId,
   }) async {
-    double remaining = totalAmount - paidAmount;
-    final batch = _db.batch();
-
+    // 1. التحقق من الرصيد قبل البدء
     bool isDebtMethod = method.contains("دين") || method.contains("ديون");
+    if (paidAmount > 0 && !isDebtMethod) {
+      bool hasBalance = await AccountService.hasEnoughBalance(cafeId, method, paidAmount);
+      if (!hasBalance) {
+        throw Exception("عذراً، الرصيد المتوفر في ($method) غير كافٍ لإتمام السداد.");
+      }
+    }
+
+    final batch = _db.batch();
+    double remaining = totalAmount - paidAmount;
 
     final purchaseRef = _db.collection('purchases').doc();
     batch.set(purchaseRef, {
@@ -71,25 +79,25 @@ class SupplierService {
       'method': remaining > 0 ? (paidAmount > 0 ? "مزيج" : "دين مورد") : (remaining < 0 ? "دفعة زائدة" : method),
     });
 
-    Map<String, dynamic> supplierUpdates = {};
-    supplierUpdates['totalBalance'] = FieldValue.increment(remaining);
-    
-    if (paidAmount > 0) {
-      if (isDebtMethod) {
-        supplierUpdates['totalBalance'] = FieldValue.increment(paidAmount);
-      } else {
-        supplierUpdates['totalPaid'] = FieldValue.increment(paidAmount);
-      }
-    }
-    
-    batch.update(_db.collection('suppliers').doc(supplierId), supplierUpdates);
+    // تحديث أرصدة المورد
+    batch.update(_db.collection('suppliers').doc(supplierId), {
+      'totalBalance': FieldValue.increment(remaining),
+      if (paidAmount > 0 && !isDebtMethod) 'totalPaid': FieldValue.increment(paidAmount),
+    });
 
-    // تفاصيل الحركة للفاتورة: سداد (طريقة الدفع)
-    String purchaseType = 'فاتورة #$invoiceNo | سداد ($method)';
+    // خصم المبلغ من الخزينة المالية
+    if (paidAmount > 0 && !isDebtMethod) {
+      await AccountService.updateBalance(
+        cafeId: cafeId, 
+        method: method, 
+        amount: -paidAmount, 
+        batch: batch
+      );
+    }
 
     batch.set(_db.collection('supplier_transactions').doc(), {
       'supplierId': supplierId,
-      'type': purchaseType,
+      'type': 'فاتورة #$invoiceNo | سداد ($method)',
       'amount': totalAmount,
       'paid': paidAmount,
       'method': method,
@@ -98,19 +106,6 @@ class SupplierService {
       'parentId': managerId,
       'processedBy': currentUser.name
     });
-
-    if (paidAmount > 0 && !isDebtMethod) {
-      batch.set(_db.collection('expenses').doc(), {
-        'title': "سداد للمورد: $supplierName (فاتورة $invoiceNo)",
-        'amount': paidAmount,
-        'category': "مشتريات",
-        'method': method,
-        'date': FieldValue.serverTimestamp(),
-        'cafeId': cafeId,
-        'parentId': managerId,
-        'processedBy': currentUser.name
-      });
-    }
 
     await batch.commit();
   }
@@ -124,15 +119,32 @@ class SupplierService {
     required String cafeId,
     required String managerId,
   }) async {
-    final batch = _db.batch();
     bool isDebtMethod = method.contains("دين") || method.contains("ديون");
+    
+    // فحص الرصيد للسداد المباشر
+    if (!isDebtMethod) {
+      bool hasBalance = await AccountService.hasEnoughBalance(cafeId, method, amount);
+      if (!hasBalance) {
+        throw Exception("عذراً، الرصيد المتوفر في ($method) غير كافٍ لإتمام الدفع.");
+      }
+    }
+
+    final batch = _db.batch();
     
     batch.update(_db.collection('suppliers').doc(supplierId), {
       'totalBalance': FieldValue.increment(-amount),
       if (!isDebtMethod) 'totalPaid': FieldValue.increment(amount),
     });
 
-    // تفاصيل الحركة للسداد المباشر: سداد (طريقة الدفع)
+    if (!isDebtMethod) {
+      await AccountService.updateBalance(
+        cafeId: cafeId, 
+        method: method, 
+        amount: -amount, 
+        batch: batch
+      );
+    }
+
     batch.set(_db.collection('supplier_transactions').doc(), {
       'supplierId': supplierId,
       'type': 'سداد ($method)',
@@ -144,19 +156,6 @@ class SupplierService {
       'parentId': managerId,
       'processedBy': currentUser.name
     });
-
-    if (!isDebtMethod) {
-      batch.set(_db.collection('expenses').doc(), {
-        'title': "سداد دفعة للمورد: $supplierName",
-        'amount': amount,
-        'category': "مشتريات",
-        'method': method,
-        'date': FieldValue.serverTimestamp(),
-        'cafeId': cafeId,
-        'parentId': managerId,
-        'processedBy': currentUser.name
-      });
-    }
 
     await batch.commit();
   }

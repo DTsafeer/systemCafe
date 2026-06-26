@@ -1,4 +1,5 @@
 import 'package:cloud_firestore/cloud_firestore.dart';
+import 'account_service.dart';
 import '../utils/database_helper.dart';
 import '../pages/user_model.dart';
 import '../pages/activity_logger.dart';
@@ -24,14 +25,24 @@ class PurchaseService {
     String? unit,
   }) async {
     final firestore = FirebaseFirestore.instance;
-    final batch = firestore.batch();
-
+    
     Map<String, double> effectivePayments = payments ?? {};
     if (effectivePayments.isEmpty && amount > 0) {
       effectivePayments[method ?? "كاش"] = amount;
     }
 
-    // حساب المبالغ بدقة بناءً على مسميات طرق الدفع
+    // 1. التحقق من أرصدة الحسابات قبل البدء (للمبالغ المدفوعة فقط)
+    for (var entry in effectivePayments.entries) {
+      if (entry.value > 0 && !entry.key.contains("دين") && !entry.key.contains("ديون")) {
+        bool hasEnough = await AccountService.hasEnoughBalance(cafeId, entry.key, entry.value);
+        if (!hasEnough) {
+          throw Exception("عذراً، الرصيد المتوفر في (${entry.key}) غير كافٍ لإتمام عملية الشراء.");
+        }
+      }
+    }
+
+    final batch = firestore.batch();
+
     double debtPart = 0;
     double paidPart = 0;
 
@@ -47,7 +58,7 @@ class PurchaseService {
         ? effectivePayments.keys.first 
         : (effectivePayments.length > 1 ? "مزيج" : (method ?? "كاش"));
 
-    // 1. سجل المشتريات
+    // سجل المشتريات
     final purchaseRef = firestore.collection('purchases').doc();
     batch.set(purchaseRef, {
       'cafeId': cafeId,
@@ -70,26 +81,18 @@ class PurchaseService {
       'type': 'direct',
     });
 
-    // 2. تحديث أرصدة المورد (الدين والمدفوع)
+    // تحديث أرصدة المورد
     if (supplierId != null) {
       final supplierRef = firestore.collection('suppliers').doc(supplierId);
-      
-      Map<String, dynamic> supplierUpdates = {};
-      if (debtPart > 0) {
-        supplierUpdates['totalBalance'] = FieldValue.increment(debtPart);
-      }
-      if (paidPart > 0) {
-        supplierUpdates['totalPaid'] = FieldValue.increment(paidPart);
-      }
-      
-      if (supplierUpdates.isNotEmpty) {
-        batch.update(supplierRef, supplierUpdates);
-      }
+      batch.update(supplierRef, {
+        'totalBalance': FieldValue.increment(debtPart),
+        'totalPaid': FieldValue.increment(paidPart),
+      });
       
       final transRef = firestore.collection('supplier_transactions').doc();
       batch.set(transRef, {
         'supplierId': supplierId,
-        'type': debtPart > 0 ? 'شراء آجل: $productName' : 'شراء نقدي: $productName',
+        'type': debtPart > 0 ? 'شراء آجل ($mainMethod): $productName' : 'شراء نقدي ($mainMethod): $productName',
         'amount': amount,
         'paid': paidPart,
         'method': mainMethod,
@@ -100,7 +103,7 @@ class PurchaseService {
       });
     }
 
-    // 3. تحديث المخزن الرئيسي
+    // تحديث المخزن الرئيسي
     if (prodId != null && prodId != "other") {
       final invRef = firestore.collection('inventory').doc(prodId);
       Map<String, dynamic> invUpdate = {
@@ -114,9 +117,15 @@ class PurchaseService {
       _dbHelper.updateInventoryQtyLocal(productName, qty, cafeId); 
     }
 
-    // 4. سجل المصاريف (للمبالغ المدفوعة فقط)
-    effectivePayments.forEach((m, amt) {
+    // خصم المبالغ من الخزينة المالية وسجل المصاريف
+    for (var entry in effectivePayments.entries) {
+      String m = entry.key;
+      double amt = entry.value;
       if (amt > 0 && !m.contains("دين") && !m.contains("ديون")) {
+        // تحديث الخزينة (خصم)
+        await AccountService.updateBalance(cafeId: cafeId, method: m, amount: -amt, batch: batch);
+
+        // سجل المصاريف
         final expRef = firestore.collection('expenses').doc();
         batch.set(expRef, {
           'cafeId': cafeId,
@@ -130,7 +139,7 @@ class PurchaseService {
           'processedBy': currentUser.name,
         });
       }
-    });
+    }
 
     await batch.commit();
 

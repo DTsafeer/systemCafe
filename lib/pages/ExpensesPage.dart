@@ -6,6 +6,8 @@ import 'package:intl/intl.dart';
 import 'user_model.dart';
 import 'MainLayout.dart';
 import 'activity_logger.dart';
+import '../services/account_service.dart';
+import '../services/cafe_service.dart';
 
 class ExpensesPage extends StatefulWidget {
   final User currentUser;
@@ -52,9 +54,7 @@ class _ExpensesPageState extends State<ExpensesPage> {
         currentUser: widget.currentUser,
         currentPage: 'expenses',
         child: const Scaffold(
-          body: Center(
-            child: Text("عذراً، لا تملك صلاحية لعرض صفحة المصاريف", style: TextStyle(fontWeight: FontWeight.bold)),
-          ),
+          body: Center(child: Text("عذراً، لا تملك صلاحية لعرض صفحة المصاريف", style: TextStyle(fontWeight: FontWeight.bold))),
         ),
       );
     }
@@ -153,6 +153,7 @@ class _ExpensesPageState extends State<ExpensesPage> {
     final titleCtrl = TextEditingController();
     final amtCtrl = TextEditingController();
     String category = "أخرى";
+    String selectedMethod = "كاش";
     bool isLoading = false;
     
     showDialog(
@@ -167,14 +168,32 @@ class _ExpensesPageState extends State<ExpensesPage> {
               child: Column(
                 mainAxisSize: MainAxisSize.min,
                 children: [
-                  TextField(controller: titleCtrl, decoration: const InputDecoration(labelText: "البيان")),
+                  TextField(controller: titleCtrl, decoration: const InputDecoration(labelText: "البيان (ماذا اشتريت؟)")),
                   TextField(controller: amtCtrl, decoration: const InputDecoration(labelText: "المبلغ"), keyboardType: TextInputType.number),
-                  const SizedBox(height: 10),
-                  DropdownButton<String>(
+                  const SizedBox(height: 15),
+                  DropdownButtonFormField<String>(
                     value: category,
-                    isExpanded: true,
+                    decoration: const InputDecoration(labelText: "التصنيف"),
                     items: ["رواتب", "إيجار", "كهرباء", "مياه", "إنترنت", "صيانة", "مواد تنظيف", "أخرى"].map((c) => DropdownMenuItem(value: c, child: Text(c))).toList(),
                     onChanged: (v) => setDialogState(() => category = v!),
+                  ),
+                  const SizedBox(height: 10),
+                  StreamBuilder<CafeSettings>(
+                    stream: CafeService.streamCafeSettings(widget.currentUser.cafeId),
+                    builder: (context, snap) {
+                      List<String> methods = ["كاش"];
+                      if (snap.hasData) {
+                        for (var m in snap.data!.paymentMethods) {
+                          if (!m.contains("دين") && m != "كاش") methods.add(m);
+                        }
+                      }
+                      return DropdownButtonFormField<String>(
+                        value: selectedMethod,
+                        decoration: const InputDecoration(labelText: "الدفع من حساب:"),
+                        items: methods.map((m) => DropdownMenuItem(value: m, child: Text(m))).toList(),
+                        onChanged: (v) => setDialogState(() => selectedMethod = v!),
+                      );
+                    }
                   ),
                   if (isLoading) const Padding(padding: EdgeInsets.only(top: 15), child: CircularProgressIndicator()),
                 ],
@@ -188,29 +207,56 @@ class _ExpensesPageState extends State<ExpensesPage> {
                 if (title.isNotEmpty && amt > 0) {
                   setDialogState(() => isLoading = true);
                   
-                  // Firestore handles offline persistence
-                  FirebaseFirestore.instance.collection('expenses').add({
-                    'cafeId': widget.currentUser.cafeId,
-                    'parentId': managerId,
-                    'title': title,
-                    'amount': amt,
-                    'category': category,
-                    'date': FieldValue.serverTimestamp(),
-                    'processedBy': widget.currentUser.name,
-                  });
+                  try {
+                    // 1. التحقق من الرصيد
+                    bool hasBalance = await AccountService.hasEnoughBalance(widget.currentUser.cafeId, selectedMethod, amt);
+                    if (!hasBalance) {
+                      throw Exception("عذراً، الرصيد في ($selectedMethod) غير كافٍ لتسجيل هذا المصروف.");
+                    }
 
-                  ActivityLogger.log(
-                    cafeId: widget.currentUser.cafeId,
-                    parentId: managerId,
-                    userId: widget.currentUser.id,
-                    userName: widget.currentUser.name,
-                    action: "مصاريف - إضافة",
-                    details: "إضافة مصروف: $title بقيمة $amt ₪ ($category)",
-                  );
+                    final batch = FirebaseFirestore.instance.batch();
+                    
+                    // 2. تحديث الخزينة (خصم)
+                    await AccountService.updateBalance(
+                      cafeId: widget.currentUser.cafeId, 
+                      method: selectedMethod, 
+                      amount: -amt, 
+                      batch: batch
+                    );
 
-                  if (mounted) {
-                    Navigator.pop(ctx);
-                    ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text("✅ تم إضافة المصروف")));
+                    // 3. إضافة المصروف
+                    final expRef = FirebaseFirestore.instance.collection('expenses').doc();
+                    batch.set(expRef, {
+                      'cafeId': widget.currentUser.cafeId,
+                      'parentId': managerId,
+                      'title': title,
+                      'amount': amt,
+                      'category': category,
+                      'method': selectedMethod,
+                      'date': FieldValue.serverTimestamp(),
+                      'processedBy': widget.currentUser.name,
+                    });
+
+                    await batch.commit();
+
+                    ActivityLogger.log(
+                      cafeId: widget.currentUser.cafeId,
+                      parentId: managerId,
+                      userId: widget.currentUser.id,
+                      userName: widget.currentUser.name,
+                      action: "مصاريف - إضافة",
+                      details: "إضافة مصروف: $title بقيمة $amt ₪ من $selectedMethod",
+                    );
+
+                    if (mounted) {
+                      Navigator.pop(ctx);
+                      ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text("✅ تم إضافة المصروف وخصمه من الرصيد")));
+                    }
+                  } catch (e) {
+                    setDialogState(() => isLoading = false);
+                    if (mounted) {
+                      ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(e.toString().replaceAll("Exception: ", "")), backgroundColor: Colors.red));
+                    }
                   }
                 }
               }, child: const Text("حفظ")),
@@ -229,12 +275,11 @@ class _ExpensesPageState extends State<ExpensesPage> {
       builder: (ctx) => Directionality(
         textDirection: ui.TextDirection.rtl,
         child: AlertDialog(
-          title: const Text("حذف"),
-          content: Text("حذف $title؟"),
+          title: const Text("حذف المصروف"),
+          content: Text("هل تريد حذف ($title)؟ ملاحظة: لن يتم استرجاع المبلغ للخزينة تلقائياً لضمان سلامة التقارير القديمة."),
           actions: [
             TextButton(onPressed: () => Navigator.pop(ctx), child: const Text("إلغاء")),
             TextButton(onPressed: () async { 
-              // Immediate delete locally
               FirebaseFirestore.instance.collection('expenses').doc(id).delete(); 
 
               ActivityLogger.log(
@@ -306,6 +351,7 @@ class _ExpensesListState extends State<_ExpensesList> with AutomaticKeepAliveCli
           itemBuilder: (context, index) {
             final data = docs[index].data() as Map<String, dynamic>;
             final date = (data['date'] as Timestamp?)?.toDate() ?? DateTime.now();
+            final method = data['method'] ?? "غير محدد";
             
             return Card(
               margin: const EdgeInsets.only(bottom: 12),
@@ -316,7 +362,7 @@ class _ExpensesListState extends State<_ExpensesList> with AutomaticKeepAliveCli
                   child: const Icon(Icons.payments_outlined)
                 ),
                 title: Text(data['title'], style: const TextStyle(fontWeight: FontWeight.bold)),
-                subtitle: Text(DateFormat('yyyy/MM/dd | HH:mm').format(date)),
+                subtitle: Text("${DateFormat('yyyy/MM/dd | HH:mm').format(date)} | $method"),
                 trailing: Row(
                   mainAxisSize: MainAxisSize.min,
                   children: [
@@ -328,7 +374,6 @@ class _ExpensesListState extends State<_ExpensesList> with AutomaticKeepAliveCli
                       ),
                   ],
                 ),
-                onLongPress: widget.currentUser.canDelete('expenses') ? () => widget.onDelete(docs[index].id, data['title']) : null,
               ),
             );
           },
