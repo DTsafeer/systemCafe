@@ -291,7 +291,7 @@ ${(d['note'] ?? "").toString().isNotEmpty ? '📝 *ملاحظة:* ${d['note']}' 
                 Map<String, double> methodValues = {};
                 double totalAllForStatus = 0;
 
-                final visibleMethods = _paymentMethods.where((m) => !m.contains("دين")).toList();
+                final visibleMethods = _paymentMethods.where((m) => !m.contains("ديون")).toList();
 
                 for (var d in baseFiltered) {
                   final data = d.data() as Map;
