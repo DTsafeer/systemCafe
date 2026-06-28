@@ -69,7 +69,6 @@ class _OrderPageState extends State<OrderPage> with TickerProviderStateMixin {
   List<QueryDocumentSnapshot> _allProducts = [];
   Map<String, dynamic>? _tableData;
   double _currentTimerPrice = 0.0;
-  String? _pendingInitialBarcode;
 
   Stream<QuerySnapshot>? _pendingOrdersStream;
 
@@ -93,6 +92,7 @@ class _OrderPageState extends State<OrderPage> with TickerProviderStateMixin {
       duration: const Duration(seconds: 2),
     )..repeat(reverse: true);
 
+    // تحديث الحالة بناءً على التركيز في خانة الباركود بدلاً من استشعار الجهاز
     _barcodeFieldFocusNode.addListener(() {
       if (mounted) {
         setState(() {
@@ -100,19 +100,6 @@ class _OrderPageState extends State<OrderPage> with TickerProviderStateMixin {
         });
       }
     });
-
-    // إضافة مستمع عالمي للوحة المفاتيح داخل الصفحة لالتقاط الماسح في أي وقت
-    HardwareKeyboard.instance.addHandler(_onGlobalKeyEvent);
-  }
-
-  bool _onGlobalKeyEvent(KeyEvent event) {
-    if (!mounted) return false;
-    // إذا لم يكن التركيز على أي حقل نصي، نقوم بنقل التركيز تلقائياً لحقل الباركود
-    if (event is KeyDownEvent && !_barcodeFieldFocusNode.hasFocus &&
-        !FocusScope.of(context).hasFocus) {
-       _barcodeFieldFocusNode.requestFocus();
-    }
-    return false;
   }
 
   void _restoreOrder(Map<String, dynamic> data) {
@@ -129,9 +116,6 @@ class _OrderPageState extends State<OrderPage> with TickerProviderStateMixin {
     _nameController.text = data['customer_name']?.toString() ?? "";
     _phoneController.text = data['customer_phone']?.toString() ?? "";
     _selectedCustomerId = data['selectedCustomerId']?.toString();
-
-    // حفظ الباركود القادم من الخارج لمعالجته بعد تحميل المنتجات
-    _pendingInitialBarcode = data['initial_barcode']?.toString();
   }
 
   void _onSearchChanged() {
@@ -203,16 +187,7 @@ class _OrderPageState extends State<OrderPage> with TickerProviderStateMixin {
         .where('parentId', isEqualTo: managerId)
         .snapshots()
         .listen((snap) {
-          if (mounted) {
-            setState(() => _allProducts = snap.docs);
-
-            // إذا كان هناك باركود معلق قادم من الخارج، نقوم بمعالجته الآن
-            if (_pendingInitialBarcode != null) {
-              final code = _pendingInitialBarcode!;
-              _pendingInitialBarcode = null;
-              Future.microtask(() => _onBarcodeScanned(code));
-            }
-          }
+          if (mounted) setState(() => _allProducts = snap.docs);
         }, onError: (e) => debugPrint("Products Stream Error: $e"));
   }
 
@@ -237,12 +212,7 @@ class _OrderPageState extends State<OrderPage> with TickerProviderStateMixin {
     final cleanCode = code.trim();
     if (cleanCode.isEmpty) return;
 
-    // 1. تحديد مكان كتابة الباركود ولصق الرقم وتحديث الفلترة المرئية
-    _barcodeInputController.text = cleanCode;
-    _searchController.clear(); // مسح البحث النصي العادي
-    searchNotifier.value = cleanCode.toLowerCase(); // تفعيل الفلترة بالباركود ليظهر عنصر واحد
-
-    debugPrint("🔍 جاري المعالجة التلقائية للباركود: $cleanCode");
+    debugPrint("🔍 جاري البحث عن الباركود: $cleanCode");
 
     try {
       final doc = _allProducts.firstWhere(
@@ -258,9 +228,10 @@ class _OrderPageState extends State<OrderPage> with TickerProviderStateMixin {
       double availableStock = inventoryNotifier.value[id] ?? (data['stockQuantity'] as num? ?? 0.0).toDouble();
       double currentInCart = cartNotifier.value[id]?['quantity'] ?? 0.0;
 
-      // 2. التحقق من المخزن والإضافة التلقائية للسلة
       if (currentInCart + 1 > availableStock && (_settings?.isInventoryTrackingEnabled ?? true)) {
          HapticFeedback.vibrate();
+         debugPrint("⚠️ تنبيه: المخزن غير كافٍ لمنتج ${data['name']}");
+
          ScaffoldMessenger.of(context).showSnackBar(
            SnackBar(
              content: Text("⚠️ مخزن غير كافٍ لـ: ${data['name']}"),
@@ -272,6 +243,8 @@ class _OrderPageState extends State<OrderPage> with TickerProviderStateMixin {
          _updateCart(id, data, currentInCart + 1);
 
          HapticFeedback.mediumImpact();
+         debugPrint("✅ نجاح: تم العثور على ${data['name']} وإضافته للسلة.");
+
          ScaffoldMessenger.of(context).clearSnackBars();
          ScaffoldMessenger.of(context).showSnackBar(
            SnackBar(
@@ -279,10 +252,10 @@ class _OrderPageState extends State<OrderPage> with TickerProviderStateMixin {
                children: [
                  const Icon(Icons.check_circle, color: Colors.white, size: 20),
                  const SizedBox(width: 10),
-                 Expanded(child: Text("تمت إضافة ${data['name']} بنجاح")),
+                 Expanded(child: Text("تمت إضافة ${data['name']} (الكمية: ${(currentInCart + 1).toInt()})")),
                ],
              ),
-             duration: const Duration(milliseconds: 1500),
+             duration: const Duration(milliseconds: 1200),
              backgroundColor: Colors.green[800],
              behavior: SnackBarBehavior.floating,
              shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(10)),
@@ -291,23 +264,21 @@ class _OrderPageState extends State<OrderPage> with TickerProviderStateMixin {
          );
       }
 
-      // 3. الحفاظ على استقرار الصفحة: نبقي رقم الباركود في الحقل ليبقى العنصر ظاهراً
-      // ولا نقوم بمسح `_barcodeInputController` هنا بل نجعله جاهزاً للاختيار القادم
-      _barcodeInputController.selection = TextSelection(baseOffset: 0, extentOffset: cleanCode.length);
-
+      _barcodeInputController.clear();
     } catch (e) {
-      debugPrint("❌ لم يتم العثور على المنتج بالباركود: $cleanCode");
+      debugPrint("❌ خطأ: الباركود ($cleanCode) غير مسجل في النظام.");
+
       HapticFeedback.vibrate();
       ScaffoldMessenger.of(context).showSnackBar(
         SnackBar(
-          content: Text("❌ الصنف ($cleanCode) غير موجود في النظام"),
+          content: Text("❌ الصنف ($cleanCode) غير موجود"),
           backgroundColor: Colors.orange[800],
           behavior: SnackBarBehavior.floating,
         )
       );
+      _barcodeInputController.clear();
     }
 
-    // إبقاء التركيز جاهزاً للقراءة التالية
     Future.microtask(() {
       if (mounted) _barcodeFieldFocusNode.requestFocus();
     });
@@ -454,7 +425,6 @@ class _OrderPageState extends State<OrderPage> with TickerProviderStateMixin {
         _phoneController.clear();
         _barcodeInputController.clear();
         _receivedAmountController.clear();
-        searchNotifier.value = "";
         _selectedCustomerId = null;
         _selectedCustomerBalance = null;
         _selectedCustomerLimit = null;
@@ -726,7 +696,6 @@ class _OrderPageState extends State<OrderPage> with TickerProviderStateMixin {
 
   @override
   void dispose() {
-    HardwareKeyboard.instance.removeHandler(_onGlobalKeyEvent);
     _pulseController.dispose();
     _debounce?.cancel();
     _timerTick?.cancel();
@@ -1089,7 +1058,7 @@ class _OrderPageState extends State<OrderPage> with TickerProviderStateMixin {
                         IconButton(
                           icon: const Icon(Icons.move_up_rounded, color: Colors.blue, size: 18),
                           onPressed: () => _showTransferSingleItemDialog(item),
-                          tooltip: "نقل هذا الصنف",
+                          tooltip: "نقل هذا صنف",
                         ),
                     ],
                   ),
@@ -1738,7 +1707,6 @@ class _OrderPageState extends State<OrderPage> with TickerProviderStateMixin {
     _phoneController.clear();
     _receivedAmountController.clear();
     _barcodeInputController.clear();
-    searchNotifier.value = "";
     _selectedCustomerId = null;
     _selectedCustomerBalance = null;
     _selectedCustomerLimit = null;
