@@ -704,7 +704,7 @@ class _DebtsPageState extends State<DebtsPage> {
                   TableRow(
 
                     children: [
-                      _buildHeaderCell("الرصيد المستحق للزبون"),
+                      _buildHeaderCell("الدفع التي دفعها الزبون"),
                       _buildHeaderCell("المبالغ المدانة"),
                       _buildHeaderCell("تفاصيل الدين"),
                       _buildHeaderCell("المبلغ الصافي"),

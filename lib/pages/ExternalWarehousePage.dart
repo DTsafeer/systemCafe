@@ -3,9 +3,12 @@ import 'package:flutter/material.dart';
 import 'package:cloud_firestore/cloud_firestore.dart';
 import 'package:intl/intl.dart' as intl;
 import 'package:shared_preferences/shared_preferences.dart';
+import 'package:ai_barcode_scanner/ai_barcode_scanner.dart';
 import 'user_model.dart';
 import 'MainLayout.dart';
 import 'activity_logger.dart';
+import 'addproduct.dart';
+import '../widgets/menu_dialogs.dart';
 
 class ExternalWarehousePage extends StatefulWidget {
   final User currentUser;
@@ -21,6 +24,9 @@ class _ExternalWarehousePageState extends State<ExternalWarehousePage> {
   Timer? _debounce;
   List<String> _suppliersList = ["مورد عام"];
   String? _activeCafeId;
+  final String currencySymbol = "₪";
+
+  DateTimeRange? _selectedDateRange;
 
   String get _managerId => widget.currentUser.parentId ?? widget.currentUser.id;
 
@@ -78,6 +84,38 @@ class _ExternalWarehousePageState extends State<ExternalWarehousePage> {
     });
   }
 
+  Future<void> _selectDateRange() async {
+    final DateTimeRange? picked = await showDateRangePicker(
+      context: context,
+      firstDate: DateTime(2023),
+      lastDate: DateTime.now().add(const Duration(days: 1)),
+      initialDateRange: _selectedDateRange,
+    );
+    if (picked != null && picked != _selectedDateRange) {
+      setState(() => _selectedDateRange = picked);
+    }
+  }
+
+  Future<void> _scanSearchBarcode() async {
+    await Navigator.of(context).push(
+      MaterialPageRoute(
+        builder: (context) => AiBarcodeScanner(
+          onDispose: () => Navigator.of(context).pop(),
+          onDetect: (BarcodeCapture capture) {
+            final String? value = capture.barcodes.first.rawValue;
+            if (value != null) {
+              setState(() {
+                _searchController.text = value;
+                _searchQuery = value.toLowerCase();
+              });
+              Navigator.of(context).pop();
+            }
+          },
+        ),
+      ),
+    );
+  }
+
   @override
   void dispose() {
     _searchController.dispose();
@@ -85,23 +123,183 @@ class _ExternalWarehousePageState extends State<ExternalWarehousePage> {
     super.dispose();
   }
 
-  void _addNewItem() {
-    if (!widget.currentUser.canCreate('external_warehouse')) return;
-    
-    if (_activeCafeId == null || _activeCafeId!.isEmpty) {
-      ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text("يرجى الانتظار حتى تحميل بيانات المقهى")));
-      return;
+  @override
+  Widget build(BuildContext context) {
+    final primaryColor = Colors.orange[900]!;
+
+    if (!widget.currentUser.canRead('external_warehouse')) {
+      return MainLayout(
+        currentUser: widget.currentUser,
+        currentPage: 'external_warehouse',
+        child: const Scaffold(body: Center(child: Text("لا تملك صلاحية"))),
+      );
     }
 
+    return MainLayout(
+      currentUser: widget.currentUser,
+      currentPage: 'external_warehouse',
+      child: Scaffold(
+        backgroundColor: Colors.transparent,
+        body: Column(
+          children: [
+            _buildLuxuryHeader(primaryColor),
+            Expanded(
+              child: _activeCafeId == null 
+                ? const Center(child: CircularProgressIndicator()) 
+                : _buildWarehouseContent(primaryColor),
+            ),
+          ],
+        ),
+        floatingActionButton: widget.currentUser.canCreate('external_warehouse') 
+          ? FloatingActionButton.extended(
+              onPressed: _addNewItem,
+              backgroundColor: primaryColor,
+              icon: const Icon(Icons.add_shopping_cart, color: Colors.white),
+              label: const Text("إدخال بضاعة", style: TextStyle(color: Colors.white, fontWeight: FontWeight.bold)),
+            ) 
+          : null,
+      ),
+    );
+  }
+
+  Widget _buildLuxuryHeader(Color primaryColor) {
+    return Container(
+      padding: const EdgeInsets.fromLTRB(20, 40, 20, 20),
+      decoration: BoxDecoration(
+        gradient: LinearGradient(colors: [primaryColor, primaryColor.withOpacity(0.8)]),
+        borderRadius: const BorderRadius.only(bottomLeft: Radius.circular(35), bottomRight: Radius.circular(35)),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Row(
+            mainAxisAlignment: MainAxisAlignment.spaceBetween,
+            children: [
+              const Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Text("المخزن الرئيسي", style: TextStyle(color: Colors.white, fontSize: 20, fontWeight: FontWeight.w900)),
+                  Text("إدارة التوريدات والباركود", style: TextStyle(color: Colors.white70, fontSize: 11)),
+                ],
+              ),
+              Row(
+                children: [
+                  IconButton(icon: const Icon(Icons.event, color: Colors.white), onPressed: _selectDateRange),
+                  GestureDetector(
+                    onTap: _scanSearchBarcode,
+                    child: Container(
+                      padding: const EdgeInsets.all(8),
+                      decoration: BoxDecoration(color: Colors.white.withOpacity(0.2), borderRadius: BorderRadius.circular(12)),
+                      child: const Icon(Icons.qr_code_scanner, color: Colors.white, size: 20),
+                    ),
+                  ),
+                ],
+              ),
+            ],
+          ),
+          const SizedBox(height: 15),
+          _buildSearchField(),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildSearchField() {
+    return SizedBox(
+      height: 40,
+      child: TextField(
+        controller: _searchController,
+        onChanged: _onSearchChanged,
+        style: const TextStyle(color: Colors.white),
+        decoration: InputDecoration(
+          hintText: "بحث بالاسم أو الباركود...",
+          hintStyle: const TextStyle(color: Colors.white60),
+          prefixIcon: const Icon(Icons.search, color: Colors.white70),
+          filled: true,
+          fillColor: Colors.white.withOpacity(0.12),
+          border: OutlineInputBorder(borderRadius: BorderRadius.circular(15), borderSide: BorderSide.none),
+          contentPadding: EdgeInsets.zero,
+        ),
+      ),
+    );
+  }
+
+  Widget _buildWarehouseContent(Color primaryColor) {
+    return StreamBuilder<QuerySnapshot>(
+      stream: FirebaseFirestore.instance.collection('external_warehouse').where('cafeId', isEqualTo: _activeCafeId).snapshots(),
+      builder: (context, snapshot) {
+        if (!snapshot.hasData) return const Center(child: CircularProgressIndicator());
+        
+        final docs = snapshot.data!.docs.where((d) {
+          final data = d.data() as Map<String, dynamic>;
+          if (data['parentId'] != _managerId) return false;
+          if (_searchQuery.isEmpty) return true;
+          final name = data['name']?.toString().toLowerCase() ?? "";
+          final barcode = data['barcode']?.toString().toLowerCase() ?? "";
+          return name.contains(_searchQuery) || barcode.contains(_searchQuery);
+        }).toList();
+
+        if (docs.isEmpty) return const Center(child: Text("المخزن فارغ"));
+        
+        return ListView.builder(
+          padding: const EdgeInsets.all(16),
+          itemCount: docs.length,
+          itemBuilder: (context, index) {
+            final data = docs[index].data() as Map<String, dynamic>;
+            return _buildWarehouseCard(docs[index].id, docs[index].reference, data, primaryColor);
+          },
+        );
+      },
+    );
+  }
+
+  Widget _buildWarehouseCard(String docId, DocumentReference ref, Map<String, dynamic> data, Color primaryColor) {
+    final double qty = (data['quantity'] ?? 0.0).toDouble();
+    final double unitCost = (data['unitCost'] ?? 0.0).toDouble();
+    final String? barcode = data['barcode'];
+
+    return Container(
+      margin: const EdgeInsets.only(bottom: 10),
+      decoration: BoxDecoration(color: Colors.white, borderRadius: BorderRadius.circular(18)),
+      child: ExpansionTile(
+        leading: Icon(Icons.inventory_2, color: primaryColor),
+        title: Text(data['name'] ?? "بدون اسم", style: const TextStyle(fontWeight: FontWeight.bold)),
+        subtitle: Text("$qty | التكلفة: ${unitCost.toStringAsFixed(1)} $currencySymbol", style: const TextStyle(fontSize: 11)),
+        children: [
+          Padding(
+            padding: const EdgeInsets.all(15),
+            child: Column(
+              children: [
+                Row(
+                  mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                  children: [
+                    Text("باركود: ${barcode ?? 'غير مسجل'}", style: const TextStyle(fontSize: 12, color: Colors.grey)),
+                    if (widget.currentUser.canUpdate('external_warehouse'))
+                      TextButton.icon(
+                        onPressed: () => _showTransferDialog(ref, data),
+                        icon: const Icon(Icons.move_to_inbox, size: 16),
+                        label: const Text("تحويل للمحل"),
+                      ),
+                  ],
+                ),
+                if (widget.currentUser.canDelete('external_warehouse'))
+                  Align(
+                    alignment: Alignment.centerLeft,
+                    child: IconButton(icon: const Icon(Icons.delete_outline, color: Colors.red), onPressed: () => _confirmDelete(ref, data['name'])),
+                  ),
+              ],
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  void _addNewItem() {
     final nameCtrl = TextEditingController();
     final qtyCtrl = TextEditingController();
-    final unitCtrl = TextEditingController(text: "قطعة");
     final costCtrl = TextEditingController();
-    final noteCtrl = TextEditingController();
-    String selectedSupplier = _suppliersList.isNotEmpty ? _suppliersList.first : "مورد عام";
-    bool addToExpenses = true;
-    double unitPrice = 0.0;
-    DateTime selectedDate = DateTime.now();
+    final barcodeCtrl = TextEditingController();
     bool isLoading = false;
 
     showDialog(
@@ -109,164 +307,70 @@ class _ExternalWarehousePageState extends State<ExternalWarehousePage> {
       barrierDismissible: false,
       builder: (ctx) => StatefulBuilder(
         builder: (context, setDialogState) {
-          void calculateUnitPrice() {
-            double q = double.tryParse(qtyCtrl.text) ?? 0.0;
-            double c = double.tryParse(costCtrl.text) ?? 0.0;
-            setDialogState(() {
-              unitPrice = (q > 0) ? (c / q) : 0.0;
-            });
-          }
-
           return Directionality(
             textDirection: TextDirection.rtl,
-            child: Dialog(
-              shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(25)),
-              child: SingleChildScrollView(
-                child: Container(
-                  padding: const EdgeInsets.all(24),
-                  child: Column(
-                    mainAxisSize: MainAxisSize.min,
-                    crossAxisAlignment: CrossAxisAlignment.start,
-                    children: [
-                      Row(
-                        children: [
-                          const Icon(Icons.add_business_rounded, color: Colors.orange, size: 30),
-                          const SizedBox(width: 12),
-                          const Text("مشتريات جديدة للمخزن", style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold)),
-                        ],
-                      ),
-                      const SizedBox(height: 20),
-                      DropdownButtonFormField<String>(
-                        value: selectedSupplier,
-                        decoration: const InputDecoration(labelText: "المورد", border: OutlineInputBorder()),
-                        items: _suppliersList.map((s) => DropdownMenuItem(value: s, child: Text(s))).toList(),
-                        onChanged: isLoading ? null : (v) => setDialogState(() => selectedSupplier = v!),
-                      ),
-                      const SizedBox(height: 15),
-                      TextField(
-                        controller: nameCtrl,
-                        enabled: !isLoading,
-                        decoration: const InputDecoration(labelText: "اسم الصنف (مثل: قهوة)", border: OutlineInputBorder(), prefixIcon: Icon(Icons.inventory_2_outlined)),
-                      ),
-                      const SizedBox(height: 15),
-                      Row(
-                        children: [
-                          Expanded(child: TextField(controller: qtyCtrl, enabled: !isLoading, onChanged: (_) => calculateUnitPrice(), keyboardType: const TextInputType.numberWithOptions(decimal: true), decoration: const InputDecoration(labelText: "الكمية", border: OutlineInputBorder()))),
-                          const SizedBox(width: 10),
-                          Expanded(child: TextField(controller: unitCtrl, enabled: !isLoading, decoration: const InputDecoration(labelText: "الوحدة", border: OutlineInputBorder()))),
-                        ],
-                      ),
-                      const SizedBox(height: 15),
-                      TextField(
-                        controller: costCtrl,
-                        enabled: !isLoading,
-                        onChanged: (_) => calculateUnitPrice(),
-                        keyboardType: const TextInputType.numberWithOptions(decimal: true),
-                        decoration: const InputDecoration(labelText: "التكلفة الإجمالية", border: OutlineInputBorder(), suffixText: "₪"),
-                      ),
-                      const SizedBox(height: 15),
-                      TextField(
-                        controller: noteCtrl,
-                        enabled: !isLoading,
-                        decoration: const InputDecoration(labelText: "التفاصيل / ملاحظات", border: OutlineInputBorder(), prefixIcon: Icon(Icons.notes_rounded)),
-                      ),
-                      if (unitPrice > 0)
-                        Padding(padding: const EdgeInsets.all(8), child: Text("تكلفة الواحدة: ${unitPrice.toStringAsFixed(2)} ₪", style: const TextStyle(color: Colors.blue, fontWeight: FontWeight.bold))),
-                      
-                      ListTile(
-                        contentPadding: EdgeInsets.zero,
-                        enabled: !isLoading,
-                        leading: const Icon(Icons.calendar_today, color: Colors.blue),
-                        title: Text("التاريخ: ${intl.DateFormat('yyyy/MM/dd').format(selectedDate)}"),
-                        onTap: () async {
-                          final picked = await showDatePicker(context: context, initialDate: selectedDate, firstDate: DateTime(2020), lastDate: DateTime.now());
-                          if (picked != null) setDialogState(() => selectedDate = picked);
+            child: AlertDialog(
+              title: const Text("إدخال بضاعة للمخزن"),
+              content: Column(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  TextField(controller: nameCtrl, decoration: const InputDecoration(labelText: "اسم الصنف")),
+                  const SizedBox(height: 10),
+                  TextField(
+                    controller: barcodeCtrl,
+                    readOnly: true, // توحيد: الباركود للقراءة فقط هنا
+                    decoration: InputDecoration(
+                      labelText: "الباركود (يعدل من صفحة المنتج)",
+                      prefixIcon: const Icon(Icons.qr_code_2),
+                      helperText: "استخدم صفحة 'المنيو' لتعديل الباركود",
+                      suffixIcon: IconButton(
+                        icon: const Icon(Icons.open_in_new, size: 16),
+                        onPressed: () {
+                          // توجيه لصفحة البحث/الإضافة لتعريف الباركود
+                          Navigator.push(context, MaterialPageRoute(builder: (_) => AddProduct(currentUser: widget.currentUser)));
                         },
                       ),
-          
-                      CheckboxListTile(
-                        contentPadding: EdgeInsets.zero,
-                        enabled: !isLoading,
-                        title: const Text("تسجيل كمصروف مالي", style: TextStyle(fontSize: 14)),
-                        value: addToExpenses,
-                        onChanged: (v) => setDialogState(() => addToExpenses = v!),
-                      ),
-                      if (isLoading) const Center(child: Padding(padding: EdgeInsets.all(10), child: CircularProgressIndicator())),
-                      const SizedBox(height: 20),
-                      Row(
-                        children: [
-                          Expanded(child: TextButton(onPressed: isLoading ? null : () => Navigator.pop(ctx), child: const Text("إلغاء"))),
-                          const SizedBox(width: 10),
-                          Expanded(child: ElevatedButton(
-                            style: ElevatedButton.styleFrom(backgroundColor: Colors.orange[800], foregroundColor: Colors.white),
-                            onPressed: isLoading ? null : () async {
-                               final name = nameCtrl.text.trim();
-                               if (name.isEmpty) return;
-                               
-                               setDialogState(() => isLoading = true);
-                               try {
-                                 final qty = double.tryParse(qtyCtrl.text) ?? 0.0;
-                                 final cost = double.tryParse(costCtrl.text) ?? 0.0;
-                                 final note = noteCtrl.text.trim();
-            
-                                 final batch = FirebaseFirestore.instance.batch();
-                                 
-                                 final warehouseRef = FirebaseFirestore.instance.collection('external_warehouse').doc();
-                                 batch.set(warehouseRef, {
-                                   'name': name,
-                                   'quantity': qty,
-                                   'unit': unitCtrl.text,
-                                   'costPrice': cost,
-                                   'supplier': selectedSupplier,
-                                   'unitCost': (qty > 0) ? (cost / qty) : 0.0,
-                                   'cafeId': _activeCafeId,
-                                   'parentId': _managerId,
-                                   'note': note,
-                                   'dateAdded': Timestamp.fromDate(selectedDate),
-                                 });
-            
-                                 if (addToExpenses && cost > 0) {
-                                   final expenseRef = FirebaseFirestore.instance.collection('expenses').doc();
-                                   batch.set(expenseRef, {
-                                     'cafeId': _activeCafeId,
-                                     'parentId': _managerId,
-                                     'title': "مشتريات من $selectedSupplier: $name",
-                                     'amount': cost,
-                                     'category': "مشتريات مخزن",
-                                     'note': note,
-                                     'date': Timestamp.fromDate(selectedDate),
-                                     'processedBy': widget.currentUser.name,
-                                   });
-                                 }
-                                 
-                                 await batch.commit();
-
-                                 ActivityLogger.log(
-                                   cafeId: _activeCafeId!,
-                                   parentId: _managerId,
-                                   userId: widget.currentUser.id,
-                                   userName: widget.currentUser.name,
-                                   action: "مشتريات مخزن - إضافة",
-                                   details: "إضافة بضاعة للمخزن: $name بكمية $qty من $selectedSupplier",
-                                 );
-
-                                 if (ctx.mounted) {
-                                   Navigator.pop(ctx);
-                                   ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text("✅ تم الحفظ (سيتم المزامنة تلقائياً)")));
-                                 }
-                               } catch (e) {
-                                 setDialogState(() => isLoading = false);
-                                 if (ctx.mounted) ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text("خطأ: $e")));
-                               }
-                            },
-                            child: const Text("حفظ المشتريات"),
-                          )),
-                        ],
-                      ),
+                    ),
+                  ),
+                  const SizedBox(height: 10),
+                  Row(
+                    children: [
+                      Expanded(child: TextField(controller: qtyCtrl, keyboardType: TextInputType.number, decoration: const InputDecoration(labelText: "الكمية"))),
+                      const SizedBox(width: 10),
+                      Expanded(child: TextField(controller: costCtrl, keyboardType: TextInputType.number, decoration: const InputDecoration(labelText: "التكلفة الإجمالية"))),
                     ],
                   ),
-                ),
+                ],
               ),
+              actions: [
+                TextButton(onPressed: () => Navigator.pop(ctx), child: const Text("إلغاء")),
+                ElevatedButton(
+                  onPressed: isLoading ? null : () async {
+                    if (nameCtrl.text.isEmpty) return;
+                    setDialogState(() => isLoading = true);
+                    try {
+                      final qty = double.tryParse(qtyCtrl.text) ?? 0.0;
+                      final cost = double.tryParse(costCtrl.text) ?? 0.0;
+                      
+                      // عملية الحفظ في Firebase
+                      await FirebaseFirestore.instance.collection('external_warehouse').add({
+                        'name': nameCtrl.text.trim(),
+                        'quantity': qty,
+                        'unitCost': qty > 0 ? (cost / qty) : 0.0,
+                        'barcode': barcodeCtrl.text.trim(),
+                        'cafeId': _activeCafeId,
+                        'parentId': _managerId,
+                        'dateAdded': FieldValue.serverTimestamp(),
+                      });
+                      
+                      if (ctx.mounted) Navigator.pop(ctx);
+                    } catch (e) {
+                      setDialogState(() => isLoading = false);
+                    }
+                  },
+                  child: const Text("حفظ"),
+                ),
+              ],
             ),
           );
         },
@@ -275,125 +379,29 @@ class _ExternalWarehousePageState extends State<ExternalWarehousePage> {
   }
 
   void _showTransferDialog(DocumentReference ref, Map<String, dynamic> data) {
-    if (!widget.currentUser.canUpdate('external_warehouse')) return;
-
     final qtyCtrl = TextEditingController();
-    final double currentQty = (data['quantity'] ?? 0.0).toDouble();
-    DateTime transferDate = DateTime.now();
     bool isLoading = false;
 
     showDialog(
       context: context,
-      barrierDismissible: false,
       builder: (ctx) => StatefulBuilder(
         builder: (context, setDialogState) => Directionality(
           textDirection: TextDirection.rtl,
           child: AlertDialog(
-            shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(20)),
-            title: Text("تحويل ${data['name']} إلى المحل"),
-            content: SingleChildScrollView(
-              child: Column(
-                mainAxisSize: MainAxisSize.min,
-                children: [
-                  Text("الكمية المتوفرة في المخزن: $currentQty ${data['unit'] ?? ''}", style: const TextStyle(fontSize: 13, color: Colors.grey)),
-                  const SizedBox(height: 15),
-                  TextField(
-                    controller: qtyCtrl,
-                    enabled: !isLoading,
-                    keyboardType: const TextInputType.numberWithOptions(decimal: true),
-                    autofocus: true,
-                    decoration: InputDecoration(
-                      labelText: "الكمية المراد تحويلها للمحل",
-                      border: OutlineInputBorder(borderRadius: BorderRadius.circular(12)),
-                      filled: true,
-                      fillColor: Colors.grey[50],
-                    ),
-                  ),
-                  const SizedBox(height: 10),
-                  ListTile(
-                    contentPadding: EdgeInsets.zero,
-                    enabled: !isLoading,
-                    leading: const Icon(Icons.calendar_today, color: Colors.blue, size: 20),
-                    title: Text("تاريخ التحويل: ${intl.DateFormat('yyyy/MM/dd').format(transferDate)}", style: const TextStyle(fontSize: 13)),
-                    onTap: () async {
-                      final picked = await showDatePicker(context: context, initialDate: transferDate, firstDate: DateTime(2020), lastDate: DateTime.now());
-                      if (picked != null) setDialogState(() => transferDate = picked);
-                    },
-                  ),
-                  if (isLoading) const Padding(padding: EdgeInsets.all(10), child: CircularProgressIndicator()),
-                ],
-              ),
-            ),
+            title: Text("تحويل ${data['name']} للمحل"),
+            content: TextField(controller: qtyCtrl, keyboardType: TextInputType.number, decoration: const InputDecoration(labelText: "الكمية المحولة")),
             actions: [
-              TextButton(onPressed: isLoading ? null : () => Navigator.pop(ctx), child: const Text("إلغاء")),
+              TextButton(onPressed: () => Navigator.pop(ctx), child: const Text("إلغاء")),
               ElevatedButton(
-                style: ElevatedButton.styleFrom(shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(10))),
                 onPressed: isLoading ? null : () async {
                   final double transferQty = double.tryParse(qtyCtrl.text) ?? 0.0;
-                  if (transferQty <= 0 || transferQty > currentQty) {
-                    ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text("يرجى إدخال كمية صحيحة"), backgroundColor: Colors.red));
-                    return;
-                  }
-          
+                  if (transferQty <= 0) return;
                   setDialogState(() => isLoading = true);
-                  try {
-                    final batch = FirebaseFirestore.instance.batch();
-                    
-                    batch.update(ref, {'quantity': FieldValue.increment(-transferQty)});
-            
-                    final invSnap = await FirebaseFirestore.instance.collection('inventory')
-                        .where('cafeId', isEqualTo: _activeCafeId)
-                        .where('parentId', isEqualTo: _managerId)
-                        .where('name', isEqualTo: data['name']).limit(1).get();
-            
-                    if (invSnap.docs.isNotEmpty) {
-                      batch.update(invSnap.docs.first.reference, {'quantity': FieldValue.increment(transferQty)});
-                    } else {
-                      final newInvRef = FirebaseFirestore.instance.collection('inventory').doc();
-                      batch.set(newInvRef, {
-                        'name': data['name'],
-                        'quantity': transferQty,
-                        'unit': data['unit'],
-                        'cafeId': _activeCafeId,
-                        'parentId': _managerId,
-                        'low_stock_threshold': 5.0,
-                      });
-                    }
-            
-                    final transferRef = FirebaseFirestore.instance.collection('warehouse_transfers').doc();
-                    batch.set(transferRef, {
-                      'itemName': data['name'],
-                      'quantity': transferQty,
-                      'unit': data['unit'],
-                      'transferMethod': "تحويل من المخزن الخارجي",
-                      'processedBy': widget.currentUser.name,
-                      'transferredAt': Timestamp.fromDate(transferDate),
-                      'isReceived': true,
-                      'cafeId': _activeCafeId,
-                      'parentId': _managerId,
-                    });
-            
-                    await batch.commit();
-
-                    ActivityLogger.log(
-                      cafeId: _activeCafeId!,
-                      parentId: _managerId,
-                      userId: widget.currentUser.id,
-                      userName: widget.currentUser.name,
-                      action: "مخزن - تحويل للمحل",
-                      details: "تحويل $transferQty ${data['unit']} من صنف ${data['name']} للمحل",
-                    );
-            
-                    if (ctx.mounted) {
-                      Navigator.pop(ctx);
-                      ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text("✅ تم التحويل للمحل بنجاح"), backgroundColor: Colors.green));
-                    }
-                  } catch (e) {
-                    setDialogState(() => isLoading = false);
-                    if (ctx.mounted) ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text("خطأ أثناء التحويل: $e")));
-                  }
+                  // تنفيذ عملية التحويل
+                  await ref.update({'quantity': FieldValue.increment(-transferQty)});
+                  if (ctx.mounted) Navigator.pop(ctx);
                 },
-                child: const Text("تأكيد التحويل"),
+                child: const Text("تحويل"),
               ),
             ],
           ),
@@ -402,156 +410,18 @@ class _ExternalWarehousePageState extends State<ExternalWarehousePage> {
     );
   }
 
-  @override
-  Widget build(BuildContext context) {
-    final theme = Theme.of(context);
-
-    if (!widget.currentUser.canRead('external_warehouse')) {
-      return MainLayout(
-        currentUser: widget.currentUser,
-        currentPage: 'external_warehouse',
-        child: const Scaffold(
-          body: Center(
-            child: Text("عذراً، لا تملك صلاحية لعرض صفحة المخزن الخارجي", style: TextStyle(fontWeight: FontWeight.bold)),
-          ),
-        ),
-      );
-    }
-
-    return MainLayout(
-      currentUser: widget.currentUser,
-      currentPage: 'external_warehouse',
-      child: Stack(
-        children: [
-          Column(
-            children: [
-              Padding(
-                padding: const EdgeInsets.all(20),
-                child: Row(
-                  children: [
-                    Text("المخزن الخارجي", style: theme.textTheme.headlineSmall?.copyWith(fontWeight: FontWeight.bold, color: Colors.orange[900])),
-                    const Spacer(),
-                    _buildSearchField(),
-                  ],
-                ),
-              ),
-              Expanded(
-                child: _activeCafeId == null 
-                  ? const Center(child: CircularProgressIndicator()) 
-                  : StreamBuilder<QuerySnapshot>(
-                  stream: FirebaseFirestore.instance
-                      .collection('external_warehouse')
-                      .where('cafeId', isEqualTo: _activeCafeId)
-                      .snapshots(),
-                  builder: (context, snapshot) {
-                    if (snapshot.hasError) return Center(child: Text("خطأ في تحميل البيانات: ${snapshot.error}"));
-                    if (snapshot.connectionState == ConnectionState.waiting && !snapshot.hasData) return const Center(child: CircularProgressIndicator());
-                    
-                    final docs = snapshot.data!.docs.where((d) {
-                      final data = d.data() as Map<String, dynamic>;
-                      if (data['parentId'] != _managerId) return false;
-                      if (_searchQuery.isEmpty) return true;
-                      final name = data['name']?.toString().toLowerCase() ?? "";
-                      return name.contains(_searchQuery);
-                    }).toList();
-
-                    if (docs.isEmpty) return const Center(child: Text("المخزن فارغ أو لم يتم العثور على نتائج"));
-                    
-                    return ListView.builder(
-                      padding: const EdgeInsets.fromLTRB(20, 0, 20, 80),
-                      itemCount: docs.length,
-                      itemBuilder: (context, index) {
-                        final data = docs[index].data() as Map<String, dynamic>;
-                        return Card(
-                          margin: const EdgeInsets.only(bottom: 12),
-                          shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(15)),
-                          child: ListTile(
-                            leading: CircleAvatar(backgroundColor: Colors.orange[50], child: const Icon(Icons.inventory, color: Colors.orange)),
-                            title: Text(data['name'] ?? "بدون اسم", style: const TextStyle(fontWeight: FontWeight.bold)),
-                            subtitle: Column(
-                              crossAxisAlignment: CrossAxisAlignment.start,
-                              children: [
-                                Text("الكمية: ${data['quantity'] ?? 0} ${data['unit'] ?? ''} | المصدر: ${data['supplier'] ?? 'مورد عام'}"),
-                                if (data['note'] != null && data['note'].toString().isNotEmpty)
-                                  Text("ملاحظة: ${data['note']}", style: const TextStyle(fontSize: 11, fontStyle: FontStyle.italic, color: Colors.blueGrey)),
-                              ],
-                            ),
-                            trailing: Row(
-                              mainAxisSize: MainAxisSize.min,
-                              children: [
-                                if (widget.currentUser.canUpdate('external_warehouse'))
-                                  IconButton(
-                                    tooltip: "تحويل إلى المحل",
-                                    icon: const Icon(Icons.move_to_inbox_rounded, color: Colors.blue), 
-                                    onPressed: () => _showTransferDialog(docs[index].reference, data),
-                                  ),
-                                if (widget.currentUser.canDelete('external_warehouse'))
-                                  IconButton(
-                                    icon: const Icon(Icons.delete_outline, color: Colors.red), 
-                                    onPressed: () async {
-                                      final confirm = await showDialog<bool>(
-                                        context: context,
-                                        builder: (ctx) => AlertDialog(
-                                          title: const Text("تأكيد الحذف"),
-                                          content: const Text("هل تريد حذف هذا الصنف من المخزن؟"),
-                                          actions: [
-                                            TextButton(onPressed: () => Navigator.pop(ctx, false), child: const Text("إلغاء")),
-                                            TextButton(onPressed: () => Navigator.pop(ctx, true), child: const Text("حذف", style: TextStyle(color: Colors.red))),
-                                          ],
-                                        ),
-                                      );
-                                      if (confirm == true) {
-                                        try {
-                                          docs[index].reference.delete();
-                                          if (mounted) ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text("✅ تم الحذف")));
-                                        } catch (e) {
-                                          if (context.mounted) ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text("خطأ: $e")));
-                                        }
-                                      }
-                                    },
-                                  ),
-                              ],
-                            ),
-                          ),
-                        );
-                      },
-                    );
-                  },
-                ),
-              ),
-            ],
-          ),
-          if (widget.currentUser.canCreate('external_warehouse'))
-            Positioned(
-              bottom: 20,
-              left: 20,
-              child: FloatingActionButton.extended(
-                onPressed: _addNewItem,
-                backgroundColor: Colors.orange[800],
-                icon: const Icon(Icons.add_shopping_cart, color: Colors.white),
-                label: const Text("إدخل بضاعة", style: TextStyle(color: Colors.white)),
-              ),
-            ),
+  void _confirmDelete(DocumentReference ref, String? name) async {
+    final confirm = await showDialog<bool>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: const Text("تأكيد الحذف"),
+        content: Text("حذف ($name)؟"),
+        actions: [
+          TextButton(onPressed: () => Navigator.pop(ctx, false), child: const Text("إلغاء")),
+          TextButton(onPressed: () => Navigator.pop(ctx, true), child: const Text("حذف")),
         ],
       ),
     );
-  }
-
-  Widget _buildSearchField() {
-    return SizedBox(
-      width: 250, 
-      child: TextField(
-        controller: _searchController,
-        onChanged: _onSearchChanged, 
-        decoration: InputDecoration(
-          hintText: "بحث عن بضاعة...", 
-          prefixIcon: const Icon(Icons.search), 
-          filled: true, 
-          fillColor: Colors.white,
-          border: OutlineInputBorder(borderRadius: BorderRadius.circular(15), borderSide: BorderSide.none),
-          contentPadding: const EdgeInsets.symmetric(vertical: 0),
-        )
-      )
-    );
+    if (confirm == true) await ref.delete();
   }
 }

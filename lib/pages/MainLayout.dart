@@ -1,5 +1,6 @@
 import 'dart:async';
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'package:cloud_firestore/cloud_firestore.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import 'homepage.dart';
@@ -31,6 +32,7 @@ import 'PurchasesPage.dart';
 import 'ProductProfitsPage.dart';
 import 'DailySalesPage.dart';
 import 'CategoryManagementPage.dart';
+import 'orderpage.dart';
 import '../widgets/calculator_widget.dart';
 
 class UserDataProvider extends InheritedWidget {
@@ -63,7 +65,7 @@ class MainLayout extends StatefulWidget {
   State<MainLayout> createState() => _MainLayoutState();
 }
 
-class _MainLayoutState extends State<MainLayout> {
+class _MainLayoutState extends State<MainLayout> with SingleTickerProviderStateMixin {
   static String? _cachedCafeId;
   static bool? _cachedKitchenEnabled;
   static String? _cachedCafeName;
@@ -80,6 +82,13 @@ class _MainLayoutState extends State<MainLayout> {
   String? _safeCafeId = _cachedCafeId;
   bool _hasShownWarning = false;
 
+  // Scanner detection logic
+  bool _isScannerActive = false;
+  DateTime? _lastKeyEventTime;
+  int _fastKeyCount = 0;
+  String _barcodeBuffer = "";
+  late AnimationController _scannerPulseController;
+
   @override
   void initState() {
     super.initState();
@@ -88,6 +97,80 @@ class _MainLayoutState extends State<MainLayout> {
     _safeCafeId = widget.currentUser.cafeId.isNotEmpty ? widget.currentUser.cafeId : _cachedCafeId;
     _initSafeData();
     _listenToUpdates();
+
+    _scannerPulseController = AnimationController(
+      vsync: this,
+      duration: const Duration(seconds: 2),
+    )..repeat(reverse: true);
+
+    HardwareKeyboard.instance.addHandler(_onKeyEvent);
+  }
+
+  bool _onKeyEvent(KeyEvent event) {
+    if (event is KeyDownEvent) {
+      final now = DateTime.now();
+      
+      if (event.logicalKey == LogicalKeyboardKey.enter || event.logicalKey == LogicalKeyboardKey.numpadEnter) {
+        if (_barcodeBuffer.isNotEmpty && _fastKeyCount > 3) {
+          _handleExternalBarcodeScan(_barcodeBuffer);
+        }
+        _barcodeBuffer = "";
+        _fastKeyCount = 0;
+        return false;
+      }
+
+      if (event.character != null && event.character!.isNotEmpty) {
+        if (_lastKeyEventTime != null) {
+          final diff = now.difference(_lastKeyEventTime!).inMilliseconds;
+          if (diff < 50) {
+            _fastKeyCount++;
+            _barcodeBuffer += event.character!;
+          } else {
+            _barcodeBuffer = event.character!;
+            _fastKeyCount = 0;
+          }
+        } else {
+          _barcodeBuffer = event.character!;
+        }
+        _lastKeyEventTime = now;
+      }
+
+      if (_fastKeyCount > 5 && !_isScannerActive) {
+        setState(() => _isScannerActive = true);
+        _resetScannerStatusAfterDelay();
+      }
+    }
+    return false;
+  }
+
+  void _handleExternalBarcodeScan(String code) {
+    debugPrint("🚀 تم رصد باركود من الخارج: $code");
+    
+    // التعديل: لا ننتقل لصفحة الكاشير إذا كنا في صفحة "المنيو" أو "المخزن"
+    // لكي نسمح للمستخدم بإضافة الباركود للمنتجات الجديدة بسلام
+    List<String> ignorePages = ["menu", "inventory", "external_warehouse", "purchases"];
+    
+    if (widget.currentPage != "orders" && !ignorePages.contains(widget.currentPage)) {
+      Navigator.push(
+        context,
+        MaterialPageRoute(
+          builder: (context) => OrderPage(
+            currentUser: widget.currentUser,
+            tableId: "takeaway",
+            tableName: "سفري (سريع)",
+            restoreData: {
+              'initial_barcode': code
+            },
+          ),
+        ),
+      );
+    }
+  }
+
+  void _resetScannerStatusAfterDelay() {
+    Timer(const Duration(minutes: 1), () {
+      if (mounted) setState(() => _isScannerActive = false);
+    });
   }
 
   Future<void> _initSafeData() async {
@@ -191,6 +274,8 @@ class _MainLayoutState extends State<MainLayout> {
 
   @override
   void dispose() {
+    HardwareKeyboard.instance.removeHandler(_onKeyEvent);
+    _scannerPulseController.dispose();
     _cafeSub?.cancel();
     _userSub?.cancel();
     _scheduledStopTimer?.cancel();
@@ -246,6 +331,7 @@ class _MainLayoutState extends State<MainLayout> {
                   title: _buildAppBarContent(isMobile, updatedUser, Colors.white),
                   leading: isMobile ? Builder(builder: (context) => IconButton(icon: const Icon(Icons.menu), onPressed: () => Scaffold.of(context).openDrawer())) : null,
                   actions: [
+                    _buildScannerStatus(),
                     IconButton(icon: const Icon(Icons.calculate_outlined), onPressed: _showCalculator, tooltip: "الآلة الحاسبة"),
                     if (_safeCafeId != null)
                       NotificationBell(cafeId: _safeCafeId!, userRole: widget.currentUser.role.name),
@@ -265,6 +351,55 @@ class _MainLayoutState extends State<MainLayout> {
             ),
           );
         }
+      ),
+    );
+  }
+
+  Widget _buildScannerStatus() {
+    return Padding(
+      padding: const EdgeInsets.symmetric(horizontal: 10),
+      child: Tooltip(
+        message: _isScannerActive ? "تم رصد نشاط للماسح" : "بانتظار استخدام الماسح",
+        child: AnimatedBuilder(
+          animation: _scannerPulseController,
+          builder: (context, child) {
+            return Row(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                Icon(
+                  Icons.barcode_reader,
+                  size: 18,
+                  color: _isScannerActive ? Colors.greenAccent : Colors.white24,
+                ),
+                if (_isScannerActive)
+                  Container(
+                    width: 6, height: 6,
+                    margin: const EdgeInsets.only(right: 4),
+                    decoration: BoxDecoration(
+                      shape: BoxShape.circle,
+                      color: Colors.greenAccent.withOpacity(0.5 + 0.5 * _scannerPulseController.value),
+                      boxShadow: [
+                        BoxShadow(
+                          color: Colors.greenAccent.withOpacity(0.3),
+                          blurRadius: 5,
+                          spreadRadius: 2,
+                        )
+                      ]
+                    ),
+                  ),
+                const SizedBox(width: 4),
+                Text(
+                  _isScannerActive ? "نشط" : "جاهز",
+                  style: TextStyle(
+                    fontSize: 10,
+                    fontWeight: FontWeight.bold,
+                    color: _isScannerActive ? Colors.greenAccent : Colors.white24,
+                  ),
+                )
+              ],
+            );
+          },
+        ),
       ),
     );
   }

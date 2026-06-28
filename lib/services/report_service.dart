@@ -7,12 +7,9 @@ class ReportService {
     required DateTime start,
     required DateTime end,
   }) async {
-    // توحيد الوقت لضمان شمول اليوم بالكامل
     DateTime s = DateTime(start.year, start.month, start.day, 0, 0, 0);
     DateTime e = DateTime(end.year, end.month, end.day, 23, 59, 59);
 
-    // تم تقليل الفلترة في الاستعلام لتقليل الحاجة للفهارس المركبة
-    // نكتفي بفلترة cafeId فقط لجلب أقل قدر ممكن من البيانات ثم الفلترة في الكود
     final salesQuery = FirebaseFirestore.instance.collection('payments')
         .where('cafeId', isEqualTo: cafeId)
         .get();
@@ -31,13 +28,9 @@ class ReportService {
 
     final results = await Future.wait([salesQuery, purchaseQuery, expenseQuery, debtTxQuery]);
 
-    // فلترة النتائج حسب managerId والتاريخ برمجياً
     final filteredSales = results[0].docs.where((doc) {
       final data = doc.data() as Map<String, dynamic>;
-      if (data['parentId'] != managerId && doc.id != managerId) {
-        // إذا كان النظام يعتمد على parentId للربط
-        if (data['parentId'] != managerId) return false;
-      }
+      if (data['parentId'] != managerId && doc.id != managerId) return false;
       final ts = data['paid_at'] ?? data['date'];
       if (ts == null) return false;
       final dt = (ts is Timestamp) ? ts.toDate() : (DateTime.tryParse(ts.toString()) ?? DateTime(2000));
@@ -79,6 +72,84 @@ class ReportService {
     };
   }
 
+  static Map<String, dynamic> calculateFullFinancialStatement(Map<String, List<QueryDocumentSnapshot>> data) {
+    double totalSales = 0;
+    double totalCOGS = 0; 
+    double totalPurchases = 0;
+    double totalExpenses = 0;
+    double totalDebtCollected = 0;
+    double totalNewDebts = 0;
+
+    for (var doc in data['sales']!) {
+      final d = doc.data() as Map<String, dynamic>;
+      if (d['is_debt_payment'] == true) {
+         totalDebtCollected += (d['total_amount'] ?? 0).toDouble();
+      } else {
+         final items = d['items'] as List? ?? [];
+         double docItemRevenue = 0;
+         for (var item in items) {
+           double cost = double.tryParse(item['costPriceAtSale']?.toString() ?? "") ?? 
+                         double.tryParse(item['costPrice']?.toString() ?? "0") ?? 0.0;
+           double qty = (item['quantity'] ?? 0.0).toDouble();
+           double revenue = double.tryParse(item['total']?.toString() ?? "0") ?? 0.0;
+           
+           totalCOGS += (cost * qty);
+           docItemRevenue += revenue;
+         }
+         totalSales += (docItemRevenue > 0) ? docItemRevenue : (d['total_amount'] ?? 0).toDouble();
+      }
+    }
+
+    for (var doc in data['debtTransactions']!) {
+      final d = doc.data() as Map<String, dynamic>;
+      final type = d['type']?.toString() ?? "";
+      if (type.contains("طلب") || type.contains("باقي فاتورة")) {
+        final items = d['items'] as List? ?? [];
+        double docItemRevenue = 0;
+        double docItemCost = 0;
+        for (var item in items) {
+          double cost = double.tryParse(item['costPriceAtSale']?.toString() ?? "") ?? 
+                        double.tryParse(item['costPrice']?.toString() ?? "0") ?? 0.0;
+          double qty = (item['quantity'] ?? 0.0).toDouble();
+          double revenue = double.tryParse(item['total']?.toString() ?? "0") ?? 0.0;
+          
+          docItemCost += (cost * qty);
+          docItemRevenue += revenue;
+        }
+        double finalDocRev = (docItemRevenue > 0) ? docItemRevenue : (d['amount'] ?? 0).toDouble();
+        totalSales += finalDocRev;
+        totalCOGS += docItemCost;
+        totalNewDebts += finalDocRev;
+      }
+    }
+
+    for (var doc in data['purchases']!) {
+      final d = doc.data() as Map<String, dynamic>;
+      totalPurchases += (d['amount'] ?? 0).toDouble();
+    }
+
+    for (var doc in data['expenses']!) {
+      final d = doc.data() as Map<String, dynamic>;
+      totalExpenses += (d['amount'] ?? 0).toDouble();
+    }
+
+    double grossProfit = totalSales - totalCOGS;
+    double netProfit = grossProfit - totalExpenses;
+    double actualLiquidityProfit = netProfit - totalNewDebts;
+
+    return {
+      'totalSales': totalSales,
+      'totalCOGS': totalCOGS,
+      'grossProfit': grossProfit,
+      'totalExpenses': totalExpenses,
+      'netProfit': netProfit,
+      'totalNewDebts': totalNewDebts,
+      'actualLiquidityProfit': actualLiquidityProfit,
+      'totalPurchases': totalPurchases,
+      'totalDebtCollected': totalDebtCollected,
+    };
+  }
+
   static Map<String, Map<String, dynamic>> calculateDailyFinance({
     required DateTime start,
     required DateTime end,
@@ -88,8 +159,6 @@ class ReportService {
     required List<QueryDocumentSnapshot> debtTx,
   }) {
     Map<String, Map<String, dynamic>> dailyFinance = {};
-    
-    // تهيئة كافة الأيام في الفترة المختارة لضمان ظهورها حتى لو كانت فارغة
     int totalDays = end.difference(start).inDays;
     for (int i = 0; i <= totalDays; i++) {
       final date = start.add(Duration(days: i));
@@ -108,7 +177,12 @@ class ReportService {
       final dt = (ts is Timestamp) ? ts.toDate() : (DateTime.tryParse(ts.toString()) ?? DateTime(2000));
       final key = "${dt.year}-${dt.month}-${dt.day}";
       if (dailyFinance.containsKey(key)) {
-        dailyFinance[key]!['sales'] += (d['total_amount'] ?? d['amount'] ?? 0).toDouble();
+        final items = d['items'] as List? ?? [];
+        double docItemRevenue = 0;
+        for (var item in items) {
+          docItemRevenue += double.tryParse(item['total']?.toString() ?? "0") ?? 0.0;
+        }
+        dailyFinance[key]!['sales'] += (docItemRevenue > 0) ? docItemRevenue : (d['total_amount'] ?? 0).toDouble();
       }
     }
 
@@ -123,6 +197,12 @@ class ReportService {
         final amount = (d['amount'] ?? 0).toDouble();
         if (type.contains("طلب") || type.contains("دين")) {
           dailyFinance[key]!['debts'] += amount;
+          final items = d['items'] as List? ?? [];
+          double docItemRevenue = 0;
+          for (var item in items) {
+            docItemRevenue += double.tryParse(item['total']?.toString() ?? "0") ?? 0.0;
+          }
+          dailyFinance[key]!['sales'] += (docItemRevenue > 0) ? docItemRevenue : amount;
         } else if (type.contains("سداد") || type.contains("تحصيل")) {
           dailyFinance[key]!['collections'] += amount;
         }
@@ -150,7 +230,6 @@ class ReportService {
         dailyFinance[key]!['expenses'] += (d['amount'] ?? 0).toDouble();
       }
     }
-
     return dailyFinance;
   }
 
@@ -169,18 +248,17 @@ class ReportService {
       final ts = d['paid_at'] ?? d['date'];
       if (ts == null) continue;
       final dt = (ts is Timestamp) ? ts.toDate() : (DateTime.tryParse(ts.toString()) ?? DateTime(2000));
-      
-      // تدقيق إضافي للتاريخ
       if (dt.isBefore(start) || dt.isAfter(end.add(const Duration(seconds: 1)))) continue;
 
       for (var item in (d['items'] as List? ?? [])) {
         String name = item['name'] ?? "منتج";
         if (search.isEmpty || name.toLowerCase().contains(search)) {
-          itemStats.putIfAbsent(name, () => {'qty': 0.0, 'total': 0.0});
+          itemStats.putIfAbsent(name, () => {'qty': 0.0, 'total': 0.0, 'count': 0});
           double qty = (item['quantity'] ?? 0).toDouble();
           double price = (item['price'] ?? item['amount'] ?? 0).toDouble();
           itemStats[name]!['qty'] += qty;
           itemStats[name]!['total'] += (qty * price);
+          itemStats[name]!['count'] += 1;
         }
       }
     }

@@ -28,10 +28,32 @@ class CategoryGridView extends StatelessWidget {
       builder: (context, query, _) {
         final filtered = allDocs.where((d) {
           final data = d.data() as Map<String, dynamic>;
-          final nameMatch = data['name'].toString().toLowerCase().contains(query.toLowerCase());
-          final categoryMatch = category == "الكل" || data['category'] == category;
-          return nameMatch && categoryMatch;
+          final String q = query.toLowerCase().trim();
+          
+          // البحث بالاسم
+          final bool nameMatch = data['name'].toString().toLowerCase().contains(q);
+          
+          // البحث بالباركود (مطابقة تامة أو جزء منه)
+          final bool barcodeMatch = data['barcode'] != null && 
+                                   data['barcode'].toString().toLowerCase().contains(q);
+          
+          final bool categoryMatch = category == "الكل" || data['category'] == category;
+          
+          return (nameMatch || barcodeMatch) && categoryMatch;
         }).toList();
+
+        if (filtered.isEmpty && query.isNotEmpty) {
+           return const Center(
+             child: Column(
+               mainAxisAlignment: MainAxisAlignment.center,
+               children: [
+                 Icon(Icons.search_off, size: 50, color: Colors.grey),
+                 SizedBox(height: 10),
+                 Text("لم يتم العثور على نتائج", style: TextStyle(color: Colors.grey)),
+               ],
+             ),
+           );
+        }
 
         return GridView.builder(
           padding: const EdgeInsets.all(8),

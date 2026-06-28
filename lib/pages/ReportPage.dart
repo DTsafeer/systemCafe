@@ -12,6 +12,7 @@ import 'MainLayout.dart';
 import '../widgets/report_widgets.dart';
 import '../widgets/report_dialogs.dart';
 import '../services/cafe_service.dart';
+import '../services/report_service.dart';
 
 class ReportPage extends StatefulWidget {
   final User currentUser;
@@ -22,7 +23,9 @@ class ReportPage extends StatefulWidget {
 }
 
 class _ReportPageState extends State<ReportPage> {
-  DateTime _selectedDate = DateTime.now();
+  DateTime _startDate = DateTime(DateTime.now().year, DateTime.now().month, DateTime.now().day);
+  DateTime _endDate = DateTime(DateTime.now().year, DateTime.now().month, DateTime.now().day, 23, 59, 59);
+  
   String currencySymbol = "₪";
   late String managerId;
   CafeSettings? _settings;
@@ -53,22 +56,19 @@ class _ReportPageState extends State<ReportPage> {
     });
   }
 
-  Future<void> _exportDailySummaryToExcel(Map<String, Map<String, dynamic>> dailyData, DateTime start, DateTime end) async {
-    if (!widget.currentUser.canRead('reports')) return;
-
-    String csv = '\uFEFFاليوم,المبيعات,التكلفة,صافي الربح,المصاريف التشغيلية\n';
-    dailyData.forEach((key, data) {
-      csv += "${data['display']},${data['sales']},${data['cogs']},${data['profit']},${data['expenses']}\n";
-    });
-    try {
-      final fileName = "Finance_Report_${intl.DateFormat('yyyyMMdd').format(start)}.csv";
-      Uint8List bytes = Uint8List.fromList(utf8.encode(csv));
-      await saveAndDownloadFile(bytes, fileName);
-      if (mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text("✅ تم تصدير التقرير المالي بنجاح")));
-      }
-    } catch (e) {
-      if (mounted) ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text("❌ خطأ أثناء التصدير: $e")));
+  Future<void> _selectDateRange() async {
+    final picked = await showDateRangePicker(
+      context: context,
+      firstDate: DateTime(2022),
+      lastDate: DateTime.now().add(const Duration(days: 365)),
+      initialDateRange: DateTimeRange(start: _startDate, end: _endDate),
+      builder: (context, child) => Directionality(textDirection: TextDirection.rtl, child: child!),
+    );
+    if (picked != null) {
+      setState(() {
+        _startDate = DateTime(picked.start.year, picked.start.month, picked.start.day);
+        _endDate = DateTime(picked.end.year, picked.end.month, picked.end.day, 23, 59, 59);
+      });
     }
   }
 
@@ -77,174 +77,230 @@ class _ReportPageState extends State<ReportPage> {
     final theme = Theme.of(context);
     final primaryColor = theme.colorScheme.primary;
 
-    if (!widget.currentUser.canRead('reports')) {
-      return MainLayout(
-        currentUser: widget.currentUser,
-        currentPage: 'reports',
-        child: const Scaffold(body: Center(child: Text("لا تملك صلاحية عرض التقارير"))),
-      );
-    }
-
     return MainLayout(
       currentUser: widget.currentUser,
       currentPage: 'reports',
       child: Scaffold(
         backgroundColor: Colors.transparent,
         appBar: AppBar(
-          title: const Text('التحليل المالي الدقيق', style: TextStyle(fontWeight: FontWeight.w900)),
+          title: const Text('التحليل المالي وكشف الحركة', style: TextStyle(fontWeight: FontWeight.w900, fontSize: 18)),
           backgroundColor: primaryColor,
           foregroundColor: Colors.white,
           elevation: 0,
           actions: [
             IconButton(
-              icon: const Icon(Icons.event),
-              onPressed: () async {
-                final picked = await showDatePicker(context: context, initialDate: _selectedDate, firstDate: DateTime(2022), lastDate: DateTime.now());
-                if (picked != null) setState(() => _selectedDate = picked);
+              tooltip: "التحليل الذكي",
+              icon: const Icon(Icons.analytics_outlined),
+              onPressed: () {
+                ReportDialogs.showDailySummaryDialog(
+                  context: context,
+                  cafeId: widget.currentUser.cafeId,
+                  managerId: managerId,
+                  selectedDate: _startDate,
+                  currencySymbol: currencySymbol,
+                  onExport: (data, s, e) {},
+                );
               },
+            ),
+            IconButton(
+              icon: const Icon(Icons.date_range),
+              onPressed: _selectDateRange,
             ),
           ],
         ),
-        body: SingleChildScrollView(
-          padding: const EdgeInsets.all(20),
-          child: Column(
-            children: [
-              _buildFinanceHeader(primaryColor),
-              const SizedBox(height: 25),
-              _buildAccountingSummary(primaryColor),
-              const SizedBox(height: 25),
-              _buildDailyZReport(primaryColor),
-            ],
-          ),
+        body: FutureBuilder<Map<String, dynamic>>(
+          future: ReportService.fetchReportData(widget.currentUser.cafeId, managerId, start: _startDate, end: _endDate)
+              .then((data) => ReportService.calculateFullFinancialStatement(data)),
+          builder: (context, snapshot) {
+            if (snapshot.connectionState == ConnectionState.waiting) return const Center(child: CircularProgressIndicator());
+            if (snapshot.hasError) return Center(child: Text("خطأ في التحميل: ${snapshot.error}"));
+            if (!snapshot.hasData) return const Center(child: Text("لا توجد بيانات"));
+
+            final stats = snapshot.data!;
+            
+            return SingleChildScrollView(
+              padding: const EdgeInsets.all(20),
+              child: Column(
+                children: [
+                  _buildHeaderCard(stats, primaryColor),
+                  const SizedBox(height: 25),
+                  _buildProfitAnalysis(stats),
+                  const SizedBox(height: 25),
+                  _buildDetailedLogSection(primaryColor),
+                  const SizedBox(height: 25),
+                ],
+              ),
+            );
+          },
         ),
       ),
     );
   }
 
-  Widget _buildFinanceHeader(Color primary) {
+  Widget _buildHeaderCard(Map<String, dynamic> stats, Color primary) {
+    final rangeStr = _startDate.day == _endDate.day && _startDate.month == _endDate.month 
+        ? intl.DateFormat('EEEE, dd MMMM yyyy', 'ar').format(_startDate)
+        : "من ${intl.DateFormat('MM/dd').format(_startDate)} إلى ${intl.DateFormat('MM/dd').format(_endDate)}";
+
     return Container(
       width: double.infinity,
-      padding: const EdgeInsets.all(30),
+      padding: const EdgeInsets.all(25),
       decoration: BoxDecoration(
         gradient: LinearGradient(colors: [primary, primary.withBlue(100)]),
         borderRadius: BorderRadius.circular(30),
+        boxShadow: [BoxShadow(color: primary.withOpacity(0.3), blurRadius: 15, offset: const Offset(0, 8))]
       ),
       child: Column(
         children: [
-          const Text("تقرير الأداء المالي لليوم", style: TextStyle(color: Colors.white70, fontSize: 14)),
-          const SizedBox(height: 8),
-          Text(intl.DateFormat('EEEE, dd MMMM yyyy').format(_selectedDate), style: const TextStyle(color: Colors.white, fontSize: 18, fontWeight: FontWeight.bold)),
+          Text(rangeStr, style: const TextStyle(color: Colors.white70, fontSize: 13, fontWeight: FontWeight.bold)),
+          const SizedBox(height: 15),
+          const Text("صافي الربح الفعلي (السيولة)", style: TextStyle(color: Colors.white, fontSize: 16)),
+          Text("${(stats['actualLiquidityProfit'] ?? 0).toStringAsFixed(1)} $currencySymbol", 
+            style: const TextStyle(color: Colors.white, fontSize: 35, fontWeight: FontWeight.w900)),
+          const SizedBox(height: 10),
+          Container(
+            padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 4),
+            decoration: BoxDecoration(color: Colors.white.withOpacity(0.2), borderRadius: BorderRadius.circular(10)),
+            child: Text("صافي الربح الدفتري (شامل الديون): ${stats['netProfit'].toStringAsFixed(1)} $currencySymbol", 
+              style: const TextStyle(color: Colors.white, fontSize: 12)),
+          ),
         ],
       ),
     );
   }
 
-  Widget _buildAccountingSummary(Color primary) {
-    final targetDateStr = intl.DateFormat('yyyyMMdd').format(_selectedDate);
+  Widget _buildProfitAnalysis(Map<String, dynamic> stats) {
+    double cashSales = (stats['totalSales'] ?? 0) - (stats['totalNewDebts'] ?? 0);
 
-    return StreamBuilder<QuerySnapshot>(
-      stream: FirebaseFirestore.instance.collection('payments')
-          .where('cafeId', isEqualTo: widget.currentUser.cafeId)
-          .where('parentId', isEqualTo: managerId).snapshots(),
-      builder: (context, salesSnap) {
-        return StreamBuilder<QuerySnapshot>(
-          stream: FirebaseFirestore.instance.collection('expenses')
-              .where('cafeId', isEqualTo: widget.currentUser.cafeId)
-              .where('parentId', isEqualTo: managerId).snapshots(),
-          builder: (context, expSnap) {
-            double totalSales = 0, totalCOGS = 0, operationalExpenses = 0;
+    return Container(
+      padding: const EdgeInsets.all(20),
+      decoration: BoxDecoration(color: Colors.white, borderRadius: BorderRadius.circular(25), boxShadow: [BoxShadow(color: Colors.black.withOpacity(0.05), blurRadius: 10)]),
+      child: Column(
+        children: [
+          const Row(children: [Icon(Icons.analytics, color: Colors.blue), SizedBox(width: 10), Text("تحليل الدورة المالية للفترة", style: TextStyle(fontWeight: FontWeight.bold))]),
+          const Divider(height: 30),
+          _row("إجمالي المبيعات (كاش + تحويل + دين)", stats['totalSales'], Colors.black),
+          _row("(-) مبيعات الديون", stats['totalNewDebts'], Colors.orange),
+          _row("(=) المبيعات النقدية (السيولة)", cashSales, Colors.blue[900]!, isBold: true),
+          const Divider(),
+          _row("إجمالي تكلفة البضاعة المباعة", stats['totalCOGS'], Colors.orange[800]!),
+          _row("إجمالي المصاريف التشغيلية", stats['totalExpenses'], Colors.red),
+          const Divider(thickness: 2),
+          _row("صافي الربح الدفتري", stats['netProfit'], Colors.blue, isBold: true),
+          _row("صافي الربح الفعلي (بدون الديون)", stats['actualLiquidityProfit'], Colors.green[900]!, isBold: true, fontSize: 18),
+        ],
+      ),
+    );
+  }
 
-            if (salesSnap.hasData) {
-              for (var doc in salesSnap.data!.docs) {
-                final data = doc.data() as Map<String, dynamic>;
-                final date = (data['paid_at'] as Timestamp?)?.toDate() ?? DateTime.now();
-                if (intl.DateFormat('yyyyMMdd').format(date) == targetDateStr) {
-                  if (data['is_debt_payment'] != true) {
-                    totalSales += (data['total_amount'] ?? 0).toDouble();
-                    List items = data['items'] as List? ?? [];
-                    for (var item in items) {
-                      double cost = (item['costPriceAtSale'] ?? 0.0).toDouble();
-                      double q = (item['quantity'] ?? 0.0).toDouble();
-                      totalCOGS += (cost * q);
-                    }
-                  }
-                }
-              }
-            }
+  Widget _buildDetailedLogSection(Color primary) {
+    return FutureBuilder<Map<String, List<QueryDocumentSnapshot>>>(
+      future: ReportService.fetchReportData(widget.currentUser.cafeId, managerId, start: _startDate, end: _endDate),
+      builder: (context, snapshot) {
+        if (!snapshot.hasData) return const SizedBox();
+        final data = snapshot.data!;
+        
+        List<Map<String, dynamic>> log = [];
+        for (var doc in data['sales']!) {
+          final d = doc.data() as Map<String, dynamic>;
+          bool isDebtPay = d['is_debt_payment'] == true;
+          log.add({
+            'time': (d['paid_at'] as Timestamp?)?.toDate() ?? DateTime.now(),
+            'title': isDebtPay ? "تحصيل دين: ${d['customer_name']}" : "مبيعات: ${d['customer_name'] ?? 'زبون عام'}",
+            'subtitle': isDebtPay ? "دفع دين سابق" : "${(d['items'] as List? ?? []).length} أصناف",
+            'amount': (d['total_amount'] ?? 0).toDouble(),
+            'icon': isDebtPay ? Icons.person_pin : Icons.shopping_bag,
+            'color': isDebtPay ? Colors.teal : Colors.green,
+          });
+        }
+        for (var doc in data['expenses']!) {
+          final d = doc.data() as Map<String, dynamic>;
+          log.add({
+            'time': (d['date'] as Timestamp?)?.toDate() ?? DateTime.now(),
+            'title': "مصروف: ${d['category'] ?? 'عام'}",
+            'subtitle': d['note'] ?? "",
+            'amount': -(d['amount'] ?? 0).toDouble(),
+            'icon': Icons.money_off,
+            'color': Colors.red,
+          });
+        }
+        for (var doc in data['purchases']!) {
+          final d = doc.data() as Map<String, dynamic>;
+          log.add({
+            'time': (d['date'] as Timestamp?)?.toDate() ?? DateTime.now(),
+            'title': "شراء مخزن: ${d['productName']}",
+            'subtitle': "كمية: ${d['quantity']}",
+            'amount': -(d['amount'] ?? 0).toDouble(),
+            'icon': Icons.inventory,
+            'color': Colors.blueGrey,
+          });
+        }
+        log.sort((a, b) => b['time'].compareTo(a['time']));
 
-            if (expSnap.hasData) {
-              for (var doc in expSnap.data!.docs) {
-                final data = doc.data() as Map<String, dynamic>;
-                final date = (data['date'] as Timestamp?)?.toDate() ?? DateTime.now();
-                if (intl.DateFormat('yyyyMMdd').format(date) == targetDateStr) {
-                  if (data['category'] != "مشتريات") {
-                    operationalExpenses += (data['amount'] ?? 0).toDouble();
-                  }
-                }
-              }
-            }
-
-            double grossProfit = totalSales - totalCOGS;
-            double netProfit = grossProfit - operationalExpenses;
-
-            return Column(
-              children: [
-                Row(children: [
-                  Expanded(child: ReportInfoCard(title: "إجمالي المبيعات", value: totalSales, color: Colors.green, icon: Icons.trending_up, currencySymbol: currencySymbol)),
-                  const SizedBox(width: 15),
-                  Expanded(child: ReportInfoCard(title: "تكلفة المباع", value: totalCOGS, color: Colors.orange, icon: Icons.shopping_bag, currencySymbol: currencySymbol)),
-                ]),
-                const SizedBox(height: 20),
-                Row(children: [
-                  Expanded(child: ReportInfoCard(title: "مصاريف تشغيلية", value: operationalExpenses, color: Colors.redAccent, icon: Icons.money_off, currencySymbol: currencySymbol)),
-                  const SizedBox(width: 15),
-                  Expanded(child: ReportInfoCard(title: "صافي الأرباح", value: netProfit, color: Colors.blue, icon: Icons.account_balance_wallet, currencySymbol: currencySymbol, isBold: true)),
-                ]),
-              ],
-            );
-          },
+        return Column(
+          children: [
+            Container(
+              decoration: BoxDecoration(color: Colors.white, borderRadius: BorderRadius.circular(25), boxShadow: [BoxShadow(color: Colors.black.withOpacity(0.05), blurRadius: 10)]),
+              child: Column(
+                children: [
+                  const Padding(
+                    padding: EdgeInsets.all(20),
+                    child: Row(children: [Icon(Icons.history_edu, color: Colors.blueGrey), SizedBox(width: 10), Text("سجل التدفق المالي للفترة", style: TextStyle(fontWeight: FontWeight.bold))]),
+                  ),
+                  const Divider(height: 1),
+                  if (log.isEmpty) const Padding(padding: EdgeInsets.all(30), child: Text("لا توجد حركات مالية في هذه الفترة")),
+                  ...log.take(50).map((m) => ListTile(
+                    leading: CircleAvatar(backgroundColor: m['color'].withOpacity(0.1), child: Icon(m['icon'], color: m['color'], size: 20)),
+                    title: Text(m['title'], style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
+                    subtitle: Text("${m['subtitle']} • ${intl.DateFormat('MM/dd hh:mm a').format(m['time'])}", style: const TextStyle(fontSize: 11)),
+                    trailing: Text("${m['amount'] > 0 ? '+' : ''}${m['amount'].toStringAsFixed(1)} $currencySymbol", 
+                      style: TextStyle(fontWeight: FontWeight.bold, color: m['amount'] >= 0 ? Colors.green[700] : Colors.red[700])),
+                  )),
+                ],
+              ),
+            ),
+            const SizedBox(height: 25),
+            _buildZReport(data['sales']!, primary),
+          ],
         );
       },
     );
   }
 
-  Widget _buildDailyZReport(Color primary) {
-    if (_settings == null) return const SizedBox.shrink();
-    return StreamBuilder<QuerySnapshot>(
-      stream: FirebaseFirestore.instance.collection('payments')
-          .where('cafeId', isEqualTo: widget.currentUser.cafeId)
-          .where('parentId', isEqualTo: managerId).snapshots(),
-      builder: (context, snapshot) {
-        Map<String, double> methodTotals = { for (var m in _settings!.paymentMethods) m: 0.0 };
-        if (snapshot.hasData) {
-          final targetDateStr = intl.DateFormat('yyyyMMdd').format(_selectedDate);
-          for (var doc in snapshot.data!.docs) {
-            final data = doc.data() as Map;
-            final date = (data['paid_at'] as Timestamp?)?.toDate() ?? DateTime.now();
-            if (intl.DateFormat('yyyyMMdd').format(date) == targetDateStr) {
-              String method = data['payment_method'] ?? "";
-              double amt = (data['total_amount'] ?? 0).toDouble();
-              if (methodTotals.containsKey(method)) methodTotals[method] = methodTotals[method]! + amt;
-            }
-          }
-        }
+  Widget _buildZReport(List<QueryDocumentSnapshot> sales, Color primary) {
+    Map<String, double> methodTotals = {};
+    for (var doc in sales) {
+      final d = doc.data() as Map;
+      String method = d['payment_method'] ?? "كاش";
+      methodTotals[method] = (methodTotals[method] ?? 0) + (d['total_amount'] ?? 0).toDouble();
+    }
 
-        return Container(
-          padding: const EdgeInsets.all(25),
-          decoration: BoxDecoration(color: Colors.white, borderRadius: BorderRadius.circular(30), boxShadow: [BoxShadow(color: Colors.black.withOpacity(0.04), blurRadius: 20)]),
-          child: Column(
-            crossAxisAlignment: CrossAxisAlignment.start,
-            children: [
-              const Row(children: [Icon(Icons.point_of_sale, color: Colors.purple), SizedBox(width: 10), Text("تقرير طرق الدفع (Z-Report)", style: TextStyle(fontWeight: FontWeight.bold))]),
-              const Divider(height: 30),
-              ...methodTotals.entries.map((e) => Padding(
-                padding: const EdgeInsets.symmetric(vertical: 8),
-                child: Row(mainAxisAlignment: MainAxisAlignment.spaceBetween, children: [Text(e.key), Text("${e.value.toStringAsFixed(1)} $currencySymbol", style: const TextStyle(fontWeight: FontWeight.bold))]),
-              )).toList(),
-            ],
-          ),
-        );
-      },
+    return Container(
+      padding: const EdgeInsets.all(20),
+      decoration: BoxDecoration(color: Colors.white, borderRadius: BorderRadius.circular(25), boxShadow: [BoxShadow(color: Colors.black.withOpacity(0.05), blurRadius: 10)]),
+      child: Column(
+        children: [
+          const Row(children: [Icon(Icons.account_balance_wallet, color: Colors.purple), SizedBox(width: 10), Text("توزيع السيولة (حسب طريقة الدفع)", style: TextStyle(fontWeight: FontWeight.bold))]),
+          const Divider(height: 30),
+          ...methodTotals.entries.map((e) => Padding(
+            padding: const EdgeInsets.symmetric(vertical: 5),
+            child: Row(mainAxisAlignment: MainAxisAlignment.spaceBetween, children: [Text(e.key), Text("${e.value.toStringAsFixed(1)} $currencySymbol", style: const TextStyle(fontWeight: FontWeight.bold))]),
+          )).toList(),
+        ],
+      ),
+    );
+  }
+
+  Widget _row(String label, double val, Color col, {bool isBold = false, double fontSize = 14}) {
+    return Padding(
+      padding: const EdgeInsets.symmetric(vertical: 8),
+      child: Row(
+        mainAxisAlignment: MainAxisAlignment.spaceBetween,
+        children: [
+          Text(label, style: TextStyle(fontWeight: isBold ? FontWeight.bold : FontWeight.normal, fontSize: fontSize - 1)),
+          Text("${val.toStringAsFixed(1)} $currencySymbol", style: TextStyle(fontWeight: FontWeight.bold, color: col, fontSize: fontSize)),
+        ],
+      ),
     );
   }
 }

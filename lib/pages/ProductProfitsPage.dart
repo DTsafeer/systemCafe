@@ -4,6 +4,7 @@ import 'package:flutter/material.dart';
 import 'package:cloud_firestore/cloud_firestore.dart';
 import 'package:intl/intl.dart' as intl;
 import 'package:fl_chart/fl_chart.dart';
+import 'package:rxdart/rxdart.dart';
 import 'user_model.dart';
 import 'MainLayout.dart';
 import '../services/cafe_service.dart';
@@ -13,7 +14,9 @@ import '../utils/save_helper_stub.dart'
 
 class ProductProfitsPage extends StatefulWidget {
   final User currentUser;
-  const ProductProfitsPage({super.key, required this.currentUser});
+  final String? initialSearchQuery; 
+
+  const ProductProfitsPage({super.key, required this.currentUser, this.initialSearchQuery});
 
   @override
   State<ProductProfitsPage> createState() => _ProductProfitsPageState();
@@ -36,6 +39,10 @@ class _ProductProfitsPageState extends State<ProductProfitsPage> {
   void initState() {
     super.initState();
     managerId = widget.currentUser.parentId ?? widget.currentUser.id;
+    if (widget.initialSearchQuery != null) {
+      _searchController.text = widget.initialSearchQuery!;
+      _searchQuery.value = widget.initialSearchQuery!.toLowerCase();
+    }
     _initPage();
   }
 
@@ -102,7 +109,7 @@ class _ProductProfitsPageState extends State<ProductProfitsPage> {
       child: Scaffold(
         backgroundColor: Colors.transparent,
         appBar: AppBar(
-          title: const Text("تحليل أرباح الأصناف", style: TextStyle(fontWeight: FontWeight.bold, fontSize: 18)),
+          title: const Text("تحليل المبيعات والأرباح الفعلية", style: TextStyle(fontWeight: FontWeight.bold, fontSize: 18)),
           backgroundColor: primaryColor,
           foregroundColor: Colors.white,
           elevation: 0,
@@ -176,91 +183,93 @@ class _ProductProfitsPageState extends State<ProductProfitsPage> {
   }
 
   Widget _buildMainContent(String query, Color primary) {
-    return StreamBuilder<QuerySnapshot>(
-      stream: FirebaseFirestore.instance.collection('payments')
-          .where('cafeId', isEqualTo: _activeCafeId)
-          .snapshots(),
+    final paymentsStream = FirebaseFirestore.instance.collection('payments')
+        .where('cafeId', isEqualTo: _activeCafeId)
+        .snapshots();
+        
+    final debtTxStream = FirebaseFirestore.instance.collection('debt_transactions')
+        .where('cafeId', isEqualTo: _activeCafeId)
+        .snapshots();
+
+    return StreamBuilder<List<QuerySnapshot>>(
+      stream: Rx.combineLatest2(paymentsStream, debtTxStream, (a, b) => [a, b]),
       builder: (context, snapshot) {
         if (snapshot.hasError) return Center(child: Text("خطأ: ${snapshot.error}"));
-        if (snapshot.connectionState == ConnectionState.waiting) return const Center(child: CircularProgressIndicator());
+        if (!snapshot.hasData) return const Center(child: CircularProgressIndicator());
         
-        final allDocs = snapshot.data?.docs ?? [];
+        final allPaymentDocs = snapshot.data![0].docs;
+        final allDebtDocs = snapshot.data![1].docs;
         
         Map<String, Map<String, dynamic>> stats = {};
-        double totalRev = 0, totalProf = 0;
+        double totalProf = 0, totalDebtRev = 0, totalAllRev = 0;
 
-        // تحديد بداية ونهاية النطاق الزمني بدقة
         DateTime startOfRange = DateTime(_startDate.year, _startDate.month, _startDate.day);
         DateTime endOfRange = DateTime(_endDate.year, _endDate.month, _endDate.day, 23, 59, 59);
 
-        for (var doc in allDocs) {
-          final data = doc.data() as Map<String, dynamic>;
-          
-          // فلترة المعرف والنوع
-          if (data['parentId'] != null && data['parentId'] != managerId) continue;
-          if (data['is_debt_payment'] == true) continue;
+        void processDocs(List<QueryDocumentSnapshot> docs, bool isFromDebtCollection) {
+          for (var doc in docs) {
+            final data = doc.data() as Map<String, dynamic>;
+            if (data['parentId'] != null && data['parentId'] != managerId) continue;
+            
+            if (data['is_debt_payment'] == true) continue;
+            if (isFromDebtCollection && !(data['type']?.toString().contains("طلب") ?? false) && !(data['type']?.toString().contains("فاتورة") ?? false)) continue;
 
-          Timestamp? paidAt = data['paid_at'] as Timestamp?;
-          if (paidAt == null) continue; // تخطي العمليات التي لم تكتمل مزامنتها بعد
-          DateTime dt = paidAt.toDate();
-          
-          if (dt.isBefore(startOfRange) || dt.isAfter(endOfRange)) continue;
+            Timestamp? dateTs = (data['paid_at'] ?? data['date']) as Timestamp?;
+            if (dateTs == null) continue;
+            DateTime dt = dateTs.toDate();
+            if (dt.isBefore(startOfRange) || dt.isAfter(endOfRange)) continue;
 
-          final items = data['items'] as List? ?? [];
-          for (var item in items) {
-            String name = item['name'] ?? "صنف غير معروف";
-            String cat = item['category'] ?? "عام";
+            String method = data['payment_method']?.toString() ?? "كاش";
+            bool isDebtSale = method.contains("دين") || method.contains("ديون") || isFromDebtCollection;
 
-            if (query.isNotEmpty && !name.toLowerCase().contains(query)) continue;
-            if (_selectedCategory != "الكل" && cat != _selectedCategory) continue;
+            final items = data['items'] as List? ?? [];
+            for (var item in items) {
+              String name = item['name'] ?? "صنف غير معروف";
+              String cat = item['category'] ?? "عام";
 
-            // تحويل القيم لـ double بأمان
-            double cost = double.tryParse(item['costPriceAtSale']?.toString() ?? "0") ?? 0.0;
-            double qty = double.tryParse(item['quantity']?.toString() ?? "0") ?? 0.0;
-            double revenue = double.tryParse(item['total']?.toString() ?? "0") ?? 0.0;
-            double profit = revenue - (cost * qty);
+              if (query.isNotEmpty && !name.toLowerCase().contains(query)) continue;
+              if (_selectedCategory != "الكل" && cat != _selectedCategory) continue;
 
-            stats.update(name, (v) => {
-              'qty': v['qty'] + qty,
-              'revenue': v['revenue'] + revenue,
-              'cost': v['cost'] + (cost * qty),
-              'profit': v['profit'] + profit,
-              'category': cat,
-            }, ifAbsent: () => {'qty': qty, 'revenue': revenue, 'cost': cost * qty, 'profit': profit, 'category': cat});
+              double cost = double.tryParse(item['costPriceAtSale']?.toString() ?? "") ?? 
+                            double.tryParse(item['costPrice']?.toString() ?? "0") ?? 0.0;
+                            
+              double qty = double.tryParse(item['quantity']?.toString() ?? "0") ?? 0.0;
+              double revenue = double.tryParse(item['total']?.toString() ?? "0") ?? 0.0;
+              double profit = revenue - (cost * qty);
 
-            totalRev += revenue;
-            totalProf += profit;
+              stats.update(name, (v) => {
+                'qty': v['qty'] + qty,
+                'revenue': v['revenue'] + revenue,
+                'cost': v['cost'] + (cost * qty),
+                'profit': v['profit'] + profit,
+                'category': cat,
+              }, ifAbsent: () => {'qty': qty, 'revenue': revenue, 'cost': cost * qty, 'profit': profit, 'category': cat});
+
+              totalProf += profit;
+              totalAllRev += revenue;
+              if (isDebtSale) totalDebtRev += revenue;
+            }
           }
         }
 
-        if (stats.isEmpty) {
-          return Center(
-            child: Column(
-              mainAxisAlignment: MainAxisAlignment.center,
-              children: [
-                const Icon(Icons.analytics_outlined, size: 60, color: Colors.grey),
-                const SizedBox(height: 15),
-                const Text("لا توجد مبيعات أصناف في هذه الفترة", style: TextStyle(color: Colors.grey, fontSize: 16)),
-                const SizedBox(height: 5),
-                Text("تأكد من اختيار التاريخ الصحيح", style: TextStyle(color: Colors.grey[400], fontSize: 12)),
-              ],
-            ),
-          );
-        }
+        processDocs(allPaymentDocs, false);
+        processDocs(allDebtDocs, true);
+
+        if (stats.isEmpty) return const Center(child: Text("لا توجد مبيعات في هذه الفترة", style: TextStyle(color: Colors.grey)));
 
         var sorted = stats.entries.toList()..sort((a, b) => b.value['profit'].compareTo(a.value['profit']));
 
         return ListView(
           padding: const EdgeInsets.all(15),
           children: [
-            _buildSummaryRow(totalRev, totalProf),
+            _buildSummaryRow(totalProf, totalDebtRev, totalAllRev),
             const SizedBox(height: 20),
             _buildChartSection(sorted.take(5).toList()),
             const SizedBox(height: 20),
             Row(
               mainAxisAlignment: MainAxisAlignment.spaceBetween,
               children: [
-                const Text("تفاصيل المنتجات", style: TextStyle(fontWeight: FontWeight.bold)),
+                const Text("تفاصيل مبيعات المنتجات", style: TextStyle(fontWeight: FontWeight.bold)),
                 TextButton.icon(onPressed: () => _exportToCSV(sorted), icon: const Icon(Icons.file_download_outlined), label: const Text("تصدير")),
               ],
             ),
@@ -271,18 +280,31 @@ class _ProductProfitsPageState extends State<ProductProfitsPage> {
     );
   }
 
-  Widget _buildSummaryRow(double rev, double prof) {
-    return Row(
+  Widget _buildSummaryRow(double totalProf, double debtAmount, double totalRev) {
+    double actualProfit = totalProf - debtAmount;
+    return Column(
       children: [
-        _statBox("إجمالي المبيعات", rev, Colors.blue),
-        const SizedBox(width: 10),
-        _statBox("صافي الأرباح", prof, Colors.green),
+        Row(
+          children: [
+            _statBox("إجمالي المبيعات", totalRev, Colors.purple),
+            const SizedBox(width: 10),
+            _statBox("إجمالي الأرباح", totalProf, Colors.blue),
+          ],
+        ),
+        const SizedBox(height: 10),
+        Row(
+          children: [
+            _statBox("مبيعات الديون", debtAmount, Colors.orange),
+            const SizedBox(width: 10),
+            _statBox("الربح الفعلي (السيولة)", actualProfit, Colors.green),
+          ],
+        ),
       ],
     );
   }
 
-  Widget _statBox(String t, double v, Color c) => Expanded(
-    child: Container(
+  Widget _statBox(String t, double v, Color c, {bool isFullWidth = false}) {
+    Widget content = Container(
       padding: const EdgeInsets.all(15),
       decoration: BoxDecoration(color: c.withOpacity(0.08), borderRadius: BorderRadius.circular(15), border: Border.all(color: c.withOpacity(0.2))),
       child: Column(
@@ -291,29 +313,25 @@ class _ProductProfitsPageState extends State<ProductProfitsPage> {
           Text("${v.toStringAsFixed(1)} $currencySymbol", style: TextStyle(fontSize: 16, fontWeight: FontWeight.w900, color: c)),
         ],
       ),
-    ),
-  );
+    );
+    return isFullWidth ? SizedBox(width: double.infinity, child: content) : Expanded(child: content);
+  }
 
   Widget _buildChartSection(List<MapEntry<String, Map<String, dynamic>>> top) {
-    if (top.isEmpty) return const SizedBox();
     return Container(
-      height: 180,
-      padding: const EdgeInsets.all(15),
+      height: 180, padding: const EdgeInsets.all(15),
       decoration: BoxDecoration(color: Colors.white, borderRadius: BorderRadius.circular(20)),
-      child: BarChart(
-        BarChartData(
-          barGroups: top.asMap().entries.map((e) => BarChartGroupData(x: e.key, barRods: [BarChartRodData(toY: e.value.value['profit'].toDouble(), color: Colors.blue[800], width: 12)])).toList(),
-          titlesData: FlTitlesData(
-            show: true,
-            bottomTitles: AxisTitles(sideTitles: SideTitles(showTitles: true, getTitlesWidget: (v, m) => Padding(padding: const EdgeInsets.only(top: 5), child: Text(top[v.toInt()].key.substring(0, top[v.toInt()].key.length > 4 ? 4 : top[v.toInt()].key.length), style: const TextStyle(fontSize: 8))))),
-            leftTitles: const AxisTitles(sideTitles: SideTitles(showTitles: false)),
-            topTitles: const AxisTitles(sideTitles: SideTitles(showTitles: false)),
-            rightTitles: const AxisTitles(sideTitles: SideTitles(showTitles: false)),
-          ),
-          gridData: const FlGridData(show: false),
-          borderData: FlBorderData(show: false),
+      child: BarChart(BarChartData(
+        barGroups: top.asMap().entries.map((e) => BarChartGroupData(x: e.key, barRods: [BarChartRodData(toY: e.value.value['profit'].toDouble(), color: Colors.blue[800], width: 12)])).toList(),
+        titlesData: FlTitlesData(
+          show: true,
+          bottomTitles: AxisTitles(sideTitles: SideTitles(showTitles: true, getTitlesWidget: (v, m) => Padding(padding: const EdgeInsets.only(top: 5), child: Text(top[v.toInt()].key.substring(0, top[v.toInt()].key.length > 4 ? 4 : top[v.toInt()].key.length), style: const TextStyle(fontSize: 8))))),
+          leftTitles: const AxisTitles(sideTitles: SideTitles(showTitles: false)),
+          topTitles: const AxisTitles(sideTitles: SideTitles(showTitles: false)),
+          rightTitles: const AxisTitles(sideTitles: SideTitles(showTitles: false)),
         ),
-      ),
+        gridData: const FlGridData(show: false), borderData: FlBorderData(show: false),
+      )),
     );
   }
 
@@ -342,7 +360,9 @@ class _ProductProfitsPageState extends State<ProductProfitsPage> {
               mainAxisAlignment: MainAxisAlignment.spaceBetween,
               children: [
                 _miniStat("الكمية", "${s['qty'].toInt()}"),
-                _miniStat("الربح", "${s['profit'].toStringAsFixed(1)}"),
+                _miniStat("المبيعات", "${s['revenue'].toStringAsFixed(1)}"),
+                _miniStat("التكلفة", "${s['cost'].toStringAsFixed(1)}"),
+                _miniStat("الربح", "${s['profit'].toStringAsFixed(1)}", isBold: true),
                 _miniStat("الهامش", "${margin.toStringAsFixed(1)}%"),
               ],
             )
@@ -352,12 +372,12 @@ class _ProductProfitsPageState extends State<ProductProfitsPage> {
     );
   }
 
-  Widget _miniStat(String l, String v) => Column(children: [Text(l, style: const TextStyle(fontSize: 10, color: Colors.grey)), Text(v, style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13))]);
+  Widget _miniStat(String l, String v, {bool isBold = false}) => Column(children: [Text(l, style: const TextStyle(fontSize: 10, color: Colors.grey)), Text(v, style: TextStyle(fontWeight: isBold ? FontWeight.w900 : FontWeight.bold, fontSize: 13, color: isBold ? Colors.green[700] : Colors.black))]);
 
   Future<void> _selectDateRange() async {
     final p = await showDateRangePicker(context: context, firstDate: DateTime(2023), lastDate: DateTime.now(), initialDateRange: DateTimeRange(start: _startDate, end: _endDate));
     if (p != null) setState(() { 
-      _startDate = DateTime(p.start.year, p.start.month, p.start.day); 
+      _startDate = p.start; 
       _endDate = DateTime(p.end.year, p.end.month, p.end.day, 23, 59, 59); 
     });
   }

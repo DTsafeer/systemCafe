@@ -17,6 +17,7 @@ class TransferService {
     String? note,
     DateTime? customDate,
     double? oldAmount,
+    List items = const [],
   }) async {
     final String managerId = currentUser.parentId ?? currentUser.id;
     if (cafeId.isEmpty || customerInput == "زبون عام" || customerInput.isEmpty) return;
@@ -91,7 +92,8 @@ class TransferService {
         'parentId': managerId,
         'processedBy': currentUser.name ?? "غير معروف",
         'userId': currentUser.id,
-        'note': note
+        'note': note,
+        'items': items, // حفظ المنتجات في سجل الديون
       });
     } catch (e) {
       debugPrint("Sync Error: $e");
@@ -118,15 +120,54 @@ class TransferService {
     String? proofImageUrl,
     bool skipSync = false,
     bool skipPaymentRecord = false,
+    bool? isPending,
   }) async {
     final String managerId = currentUser.parentId ?? currentUser.id;
     final bool isUpdate = editDoc != null;
     final DateTime now = customDate ?? DateTime.now();
 
+    final Map? oldData = isUpdate ? editDoc.data() as Map : null;
+    final bool oldIsPending = oldData?['is_pending'] ?? false;
+    final bool newIsPending = isPending ?? oldIsPending;
+
     bool shouldSaveToPayments = !method.contains("دين") && !method.contains("ديون");
     if (isDebtPayment) shouldSaveToPayments = true; 
 
     final batch = FirebaseFirestore.instance.batch();
+
+    if (shouldSaveToPayments) {
+      if (isUpdate) {
+        String oldMethod = oldData?['payment_method'] ?? "كاش";
+        double oldAmtValue = (oldData?['total_amount'] ?? 0.0).toDouble();
+        
+        if (!oldIsPending && !newIsPending) {
+          if (oldMethod == method) {
+              double netDiff = amt - oldAmtValue;
+              if (netDiff < 0) {
+                 bool canDeduct = await AccountService.hasEnoughBalance(cafeId, method, netDiff.abs());
+                 if (!canDeduct) throw Exception("عذراً، الرصيد في ($method) لا يسمح بتقليل المبلغ لهذه القيمة.");
+              }
+              await AccountService.updateBalance(cafeId: cafeId, method: method, amount: netDiff, batch: batch);
+          } else {
+              bool canDeductOld = await AccountService.hasEnoughBalance(cafeId, oldMethod, oldAmtValue);
+              if (!canDeductOld) throw Exception("عذراً، لا يمكن تغيير طريقة الدفع لأن الرصيد في ($oldMethod) غير كافٍ لسحب المبلغ القديم.");
+              
+              await AccountService.updateBalance(cafeId: cafeId, method: oldMethod, amount: -oldAmtValue, batch: batch);
+              await AccountService.updateBalance(cafeId: cafeId, method: method, amount: amt, batch: batch);
+          }
+        } else if (oldIsPending && !newIsPending) {
+          // Confirming a pending transfer
+          await AccountService.updateBalance(cafeId: cafeId, method: method, amount: amt, batch: batch);
+        } else if (!oldIsPending && newIsPending) {
+          // Moving a confirmed transfer back to pending
+          bool canDeduct = await AccountService.hasEnoughBalance(cafeId, oldMethod, oldAmtValue);
+          if (!canDeduct) throw Exception("عذراً، لا يمكن تعليق الحوالة لأن رصيد ($oldMethod) غير كافٍ لسحب المبلغ.");
+          await AccountService.updateBalance(cafeId: cafeId, method: oldMethod, amount: -oldAmtValue, batch: batch);
+        }
+      } else if (amt > 0 && !newIsPending) {
+        await AccountService.updateBalance(cafeId: cafeId, method: method, amount: amt, batch: batch);
+      }
+    }
 
     final data = {
       'customer_name': customerName,
@@ -140,7 +181,7 @@ class TransferService {
           ? (editDoc.data() as Map)['is_received'] ?? false
           : (method.contains("كاش") || method.contains("نقدي")),
       'is_debt_payment': isDebtPayment,
-      'is_pending': isUpdate ? ((editDoc.data() as Map)['is_pending'] ?? false) : false,
+      'is_pending': newIsPending,
       'cafeId': cafeId,
       'parentId': managerId,
       'paid_at': customDate ?? FieldValue.serverTimestamp(),
@@ -153,16 +194,6 @@ class TransferService {
       'proof_url': proofImageUrl,
     };
 
-    // 1. تحديث رصيد الخزينة (زيادة عند البيع أو سداد الديون)
-    if (!isUpdate && shouldSaveToPayments && amt > 0) {
-      await AccountService.updateBalance(
-        cafeId: cafeId, 
-        method: method, 
-        amount: amt, 
-        batch: batch
-      );
-    }
-
     if (!isUpdate && !skipPaymentRecord && shouldSaveToPayments) {
       final newDocRef = FirebaseFirestore.instance.collection('payments').doc();
       batch.set(newDocRef, data);
@@ -172,7 +203,8 @@ class TransferService {
 
     await batch.commit();
 
-    if (!skipSync && (isDebtPayment || method.contains("دين") || method.contains("ديون"))) {
+    // Only sync with debts if NOT pending
+    if (!newIsPending && !skipSync && (isDebtPayment || method.contains("دين") || method.contains("ديون"))) {
       await syncWithDebts(
         currentUser: currentUser,
         customerInput: customerName,
@@ -180,9 +212,25 @@ class TransferService {
         amount: amt,
         cafeId: cafeId,
         selectedId: selectedDebtId,
-        oldAmount: oldAmount,
+        oldAmount: oldIsPending ? 0.0 : oldAmount, // If it was pending, old amount for debt sync is effectively 0
         isAddingDebt: (method.contains("دين") || method.contains("ديون")) && !isDebtPayment,
         type: isDebtPayment ? "سداد دين (حوالة)" : "طلب (دين)",
+        customDate: customDate,
+        note: note,
+        items: items, // تمرير المنتجات لمزامنتها مع سجل الديون
+      ).catchError((e) => debugPrint("Background Debt Sync: $e"));
+    } else if (oldIsPending == false && newIsPending == true && !skipSync && (isDebtPayment || method.contains("دين"))) {
+       // If it was confirmed and moved to pending, we must reverse the debt sync
+       await syncWithDebts(
+        currentUser: currentUser,
+        customerInput: customerName,
+        phone: phone,
+        amount: 0.0,
+        cafeId: cafeId,
+        selectedId: selectedDebtId,
+        oldAmount: oldAmount,
+        isAddingDebt: false,
+        type: "تعليق حوالة",
         customDate: customDate,
         note: note
       ).catchError((e) => debugPrint("Background Debt Sync: $e"));
@@ -194,7 +242,7 @@ class TransferService {
       userId: currentUser.id,
       userName: currentUser.name,
       action: isDebtPayment ? "ديون - سداد" : (isUpdate ? "حوالات - تعديل" : "مبيعات - حوالة"),
-      details: "${isUpdate ? 'تعديل' : 'تسجيل'} عملية بقيمة $amt ₪ ($method) للزبون $customerName ${payerName != null ? 'بواسطة $payerName' : ''}",
+      details: "${isUpdate ? 'تعديل' : 'تسجيل'} عملية بقيمة $amt ₪ ($method) للزبون $customerName ${newIsPending ? '(معلقة)' : ''}",
     );
   }
 
@@ -205,14 +253,16 @@ class TransferService {
   }) async {
     final data = doc.data() as Map;
     final String cafeId = data['cafeId'] ?? activeCafeId ?? "";
-    final String managerId = currentUser.parentId ?? currentUser.id;
     final String method = data['payment_method'] ?? "كاش";
     final double amount = (data['total_amount'] ?? 0).toDouble();
+    final bool isPending = data['is_pending'] ?? false;
 
     final batch = FirebaseFirestore.instance.batch();
 
-    // عكس رصيد الخزينة عند الحذف (خصم)
-    if (amount > 0 && !method.contains("دين")) {
+    if (amount > 0 && !method.contains("دين") && !isPending) {
+      bool canDeduct = await AccountService.hasEnoughBalance(cafeId, method, amount);
+      if (!canDeduct) throw Exception("عذراً، لا يمكن حذف هذه الحوالة لأن رصيد الخزينة ($method) أقل من مبلغها.");
+
       await AccountService.updateBalance(
         cafeId: cafeId, 
         method: method, 
@@ -221,8 +271,8 @@ class TransferService {
       );
     }
 
-    if ((data['is_received'] == true || data['is_debt_payment'] == true || data['payment_method'].toString().contains("دين")) &&
-        data['customer_name'] != "زبون عام" && (data['is_pending'] != true)) {
+    if (!isPending && (data['is_received'] == true || data['is_debt_payment'] == true || data['payment_method'].toString().contains("دين")) &&
+        data['customer_name'] != "زبون عام") {
       await syncWithDebts(
         currentUser: currentUser,
         customerInput: data['customer_name'] ?? "",
@@ -237,7 +287,7 @@ class TransferService {
 
     await ActivityLogger.log(
       cafeId: cafeId,
-      parentId: managerId,
+      parentId: currentUser.parentId ?? currentUser.id,
       userId: currentUser.id,
       userName: currentUser.name,
       action: "حوالات - حذف",

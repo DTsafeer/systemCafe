@@ -6,6 +6,7 @@ import 'package:intl/intl.dart';
 import 'package:path_provider/path_provider.dart';
 import 'package:url_launcher/url_launcher.dart';
 import '../pages/user_model.dart';
+import 'account_service.dart';
 
 class TransferLogic {
   final User currentUser;
@@ -21,27 +22,12 @@ class TransferLogic {
         .snapshots();
   }
 
-  /// الحصول على إعدادات المقهى (العملة وطرق الدفع)
+  /// الحصول على إعدادات المقهى
   Stream<DocumentSnapshot> getCafeSettingsStream() {
     return FirebaseFirestore.instance
         .collection('cafes')
         .doc(cafeId)
         .snapshots();
-  }
-
-  /// الحصول على قائمة الزبائن الحاليين (للإكمال التلقائي)
-  Stream<List<Map<String, String>>> getExistingCustomersStream() {
-    return FirebaseFirestore.instance
-        .collection('debts')
-        .where('cafeId', isEqualTo: cafeId)
-        .snapshots()
-        .map((snapshot) => snapshot.docs.map((doc) {
-              final data = doc.data();
-              return {
-                'name': data['customer']?.toString() ?? "",
-                'phone': data['phone']?.toString() ?? "",
-              };
-            }).toList());
   }
 
   /// مزامنة الديون
@@ -54,7 +40,6 @@ class TransferLogic {
     final String managerId = currentUser.parentId ?? currentUser.id;
     if (cafeId.isEmpty || customerInput == "زبون عام") return;
 
-    final int? inputNo = int.tryParse(customerInput);
     try {
       final allDebts = await FirebaseFirestore.instance
           .collection('debts')
@@ -63,33 +48,21 @@ class TransferLogic {
           .get();
 
       DocumentReference? existingRef;
-      String actualName = customerInput;
       for (var doc in allDebts.docs) {
-        final data = doc.data();
-        if (inputNo != null && data['debtNo'] == inputNo) {
+        if (doc.data()['customer']?.toString().toLowerCase() == customerInput.toLowerCase()) {
           existingRef = doc.reference;
-          actualName = data['customer'];
-          break;
-        } else if (data['customer']?.toString().toLowerCase() ==
-            customerInput.toLowerCase()) {
-          existingRef = doc.reference;
-          actualName = data['customer'];
           break;
         }
       }
 
-      String debtDocId;
       if (existingRef != null) {
-        debtDocId = existingRef.id;
         await existingRef.update({
           'totalDebt': FieldValue.increment(amount),
           'remainingAmount': FieldValue.increment(amount),
           'lastUpdate': FieldValue.serverTimestamp(),
-          if (phone.isNotEmpty) 'phone': phone,
         });
       } else {
-        if (inputNo != null || amount < 0) return;
-        final newDoc = await FirebaseFirestore.instance.collection('debts').add({
+        await FirebaseFirestore.instance.collection('debts').add({
           'cafeId': cafeId,
           'parentId': managerId,
           'customer': customerInput,
@@ -97,59 +70,43 @@ class TransferLogic {
           'totalPaid': 0.0,
           'remainingAmount': amount,
           'date': FieldValue.serverTimestamp(),
-          'lastUpdate': FieldValue.serverTimestamp(),
           'debtNo': allDebts.size + 1001,
           'phone': phone,
         });
-        debtDocId = newDoc.id;
       }
-      await FirebaseFirestore.instance.collection('debt_transactions').add({
-        'debtId': debtDocId,
-        'customerName': actualName,
-        'type': type,
-        'amount': amount,
-        'date': FieldValue.serverTimestamp(),
-        'cafeId': cafeId,
-        'parentId': managerId,
-        'processed_by': currentUser.name
-      });
     } catch (e) {
       debugPrint("Debt Sync Error: $e");
     }
   }
 
-  /// حذف حوالة
-  Future<void> deleteTransfer(String docId, Map data) async {
-    if (data['payment_method'].toString().contains("دين")) {
-      await syncWithDebts(
-        customerInput: data['customer_name'] ?? "",
-        phone: "",
-        amount: -(data['total_amount'] ?? 0).toDouble(),
-        type: "حذف حوالة",
-      );
-    }
-    await FirebaseFirestore.instance.collection('payments').doc(docId).delete();
-  }
-
-  /// إضافة حوالة جديدة
+  /// إضافة حوالة جديدة مع تحديث الخزينة المالية
   Future<void> addManualTransfer({
     required String name,
     required String phone,
     required double amount,
     required String method,
   }) async {
+    final batch = FirebaseFirestore.instance.batch();
+    final managerId = currentUser.parentId ?? currentUser.id;
+
+    // 1. إذا كانت دين، نحدث سجل الديون
     if (method.contains("دين")) {
-      await syncWithDebts(
-        customerInput: name,
-        phone: phone,
-        amount: amount,
-      );
+      await syncWithDebts(customerInput: name, phone: phone, amount: amount);
     }
     
-    // الحوالات اليدوية تكون غير مستلمة تلقائياً إلا إذا كانت نقداً
-    bool isReceived = method.contains("كاش") || method.contains("نقدي");
+    // 2. تحديث الخزينة المالية (زيادة الرصيد) إذا لم تكن ديناً
+    if (amount > 0 && !method.contains("دين")) {
+      await AccountService.updateBalance(
+        cafeId: cafeId, 
+        method: method, 
+        amount: amount, 
+        batch: batch
+      );
+    }
 
-    await FirebaseFirestore.instance.collection('payments').add({
+    // 3. إضافة سجل الحوالة
+    final paymentRef = FirebaseFirestore.instance.collection('payments').doc();
+    batch.set(paymentRef, {
       'customer_name': name,
       'customer_phone': phone,
       'total_amount': amount,
@@ -157,40 +114,31 @@ class TransferLogic {
       'paid_at': FieldValue.serverTimestamp(),
       'processed_by': currentUser.name,
       'cafeId': cafeId,
-      'parentId': currentUser.parentId ?? currentUser.id,
-      'is_received': isReceived,
+      'parentId': managerId,
+      'is_received': method.contains("كاش") || method.contains("نقدي"),
       'items': [],
       'table': 'حوالة يدوية'
     });
+
+    await batch.commit();
   }
 
-  /// تحديث حالة الوصول
-  Future<void> updateReceivedStatus(String docId, bool status) async {
-    await FirebaseFirestore.instance
-        .collection('payments')
-        .doc(docId)
-        .update({'is_received': status});
-  }
+  /// حذف حوالة مع عكس رصيد الخزينة
+  Future<void> deleteTransfer(String docId, Map data) async {
+    final batch = FirebaseFirestore.instance.batch();
+    final double amount = (data['total_amount'] ?? 0.0).toDouble();
+    final String method = data['payment_method'] ?? "كاش";
 
-  /// تصدير البيانات إلى Excel (CSV)
-  Future<String?> exportToCSV(List<QueryDocumentSnapshot> docs) async {
-    if (docs.isEmpty) return null;
-    String csv = '\uFEFFالاسم,الهاتف,المبلغ,الطريقة,التاريخ,الوقت,الموظف,الأصناف\n';
-    for (var doc in docs) {
-      final d = doc.data() as Map;
-      final ts = d['paid_at'] as Timestamp?;
-      final items = d['items'] as List? ?? [];
-      final itemsStr = items.map((i) => "${i['quantity']}x ${i['name']}").join(" | ");
-      csv += "${d['customer_name'] ?? "عام"},${d['customer_phone'] ?? ""},${d['total_amount']},${d['payment_method']},${ts != null ? DateFormat('yyyy/MM/dd').format(ts.toDate()) : "--"},${ts != null ? DateFormat('hh:mm a').format(ts.toDate()) : "--"},${d['processed_by'] ?? "--"},\"$itemsStr\"\n";
+    if (amount > 0 && !method.contains("دين")) {
+      await AccountService.updateBalance(
+        cafeId: cafeId, 
+        method: method, 
+        amount: -amount, 
+        batch: batch
+      );
     }
 
-    if (kIsWeb) {
-      await launchUrl(Uri.parse("data:text/csv;charset=utf-8,${Uri.encodeComponent(csv)}"));
-      return "web";
-    } else {
-      final path = "${(await getExternalStorageDirectory())?.path}/Transfers_${DateTime.now().millisecondsSinceEpoch}.csv";
-      await File(path).writeAsString(csv);
-      return path;
-    }
+    batch.delete(FirebaseFirestore.instance.collection('payments').doc(docId));
+    await batch.commit();
   }
 }

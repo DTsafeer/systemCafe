@@ -5,6 +5,7 @@ import 'package:image_picker/image_picker.dart';
 import 'package:http/http.dart' as http;
 import 'package:cloud_firestore/cloud_firestore.dart';
 import 'package:intl/intl.dart' as intl;
+import 'package:ai_barcode_scanner/ai_barcode_scanner.dart';
 import '../widgets/app_components.dart';
 import '../widgets/product_search_sheet.dart';
 import 'user_model.dart';
@@ -15,8 +16,9 @@ import 'activity_logger.dart';
 class AddProduct extends StatefulWidget {
   final User currentUser;
   final Map<String, dynamic>? productToEdit;
+  final String? initialBarcode; // إضافة باركود ابتدائي عند الفتح من صفحة البيع
 
-  const AddProduct({super.key, required this.currentUser, this.productToEdit});
+  const AddProduct({super.key, required this.currentUser, this.productToEdit, this.initialBarcode});
 
   @override
   State<AddProduct> createState() => _AddProductState();
@@ -70,6 +72,9 @@ class _AddProductState extends State<AddProduct> {
         categories.add(selectedCategory!);
       }
       selectedIngredients = List<Map<String, dynamic>>.from(widget.productToEdit!['ingredients'] ?? []);
+    } else if (widget.initialBarcode != null) {
+      // إذا تم تمرير باركود من صفحة البيع، نضعه في الخانة تلقائياً
+      barcodeController.text = widget.initialBarcode!;
     }
     _loadCategories();
   }
@@ -114,6 +119,25 @@ class _AddProductState extends State<AddProduct> {
     );
   }
 
+  Future<void> _scanBarcode() async {
+    await Navigator.of(context).push(
+      MaterialPageRoute(
+        builder: (context) => AiBarcodeScanner(
+          onDispose: () => Navigator.of(context).pop(),
+          onDetect: (BarcodeCapture capture) {
+            final String? value = capture.barcodes.first.rawValue;
+            if (value != null) {
+              setState(() {
+                barcodeController.text = value;
+              });
+              Navigator.of(context).pop();
+            }
+          },
+        ),
+      ),
+    );
+  }
+
   void _saveProduct() async {
     if (nameController.text.isEmpty || (priceController.text.isEmpty && !isManualPrice)) {
       ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text("يرجى إكمال البيانات الأساسية")));
@@ -125,28 +149,50 @@ class _AddProductState extends State<AddProduct> {
     
     final String productId = _linkedInventoryId ?? (_isEditMode ? widget.productToEdit!['id'] : FirebaseFirestore.instance.collection('products').doc().id);
     
+    final sellingPrice = isManualPrice ? 0.0 : (double.tryParse(priceController.text.trim()) ?? 0.0);
+    final rawCostPrice = double.tryParse(costPriceController.text.trim()) ?? 0.0;
+    final taxPercent = double.tryParse(taxController.text) ?? 0.0;
+    final extraCosts = double.tryParse(extraCostsController.text) ?? 0.0;
+
+    final double finalCostPrice = (rawCostPrice + extraCosts) * (1 + (taxPercent / 100));
+
     final productData = {
       'name': nameController.text.trim(),
-      'price': isManualPrice ? 0.0 : (double.tryParse(priceController.text.trim()) ?? 0.0),
-      'costPrice': double.tryParse(costPriceController.text.trim()) ?? 0.0,
+      'price': sellingPrice,
+      'costPrice': rawCostPrice, 
+      'finalCostPrice': finalCostPrice, 
       'barcode': barcodeController.text.trim(),
       'category': selectedCategory,
       'imagePath': imageUrl ?? "",
       'ingredients': List.from(selectedIngredients),
       'isManualPrice': isManualPrice,
-      'trackInventory': true, // مفعل دائماً لضمان الخصم من المخزن عند البيع
+      'trackInventory': true, 
       'cafeId': widget.currentUser.cafeId,
       'parentId': widget.currentUser.parentId ?? widget.currentUser.id,
       'isAvailable': true,
-      'tax': double.tryParse(taxController.text) ?? 0.0,
-      'extraCosts': double.tryParse(extraCostsController.text) ?? 0.0,
+      'tax': taxPercent,
+      'extraCosts': extraCosts,
       'extraDetails': extraDetailsController.text.trim(),
       'created_at': _isEditMode ? widget.productToEdit!['created_at'] : FieldValue.serverTimestamp(),
       'last_update': FieldValue.serverTimestamp(),
     };
 
     try {
-      await FirebaseFirestore.instance.collection('products').doc(productId).set(productData, SetOptions(merge: true));
+      final batch = FirebaseFirestore.instance.batch();
+      
+      final productRef = FirebaseFirestore.instance.collection('products').doc(productId);
+      batch.set(productRef, productData, SetOptions(merge: true));
+
+      final inventoryRef = FirebaseFirestore.instance.collection('inventory').doc(productId);
+      batch.set(inventoryRef, {
+        'sellingPrice': sellingPrice,
+        'costPrice': finalCostPrice, 
+        'lastCostPrice': finalCostPrice,
+        'barcode': productData['barcode'], 
+        'name': productData['name'],
+      }, SetOptions(merge: true));
+
+      await batch.commit();
 
       await ActivityLogger.log(
         cafeId: widget.currentUser.cafeId,
@@ -154,7 +200,7 @@ class _AddProductState extends State<AddProduct> {
         userId: widget.currentUser.id,
         userName: widget.currentUser.name,
         action: _isEditMode ? "منيو - تعديل" : "منيو - إضافة",
-        details: "${_isEditMode ? 'تعديل' : 'إضافة'} منتج: ${productData['name']} بسعر ${productData['price']} ₪",
+        details: "تحديث ${productData['name']}: باركود (${productData['barcode']})",
       );
 
       if (mounted) {
@@ -184,6 +230,8 @@ class _AddProductState extends State<AddProduct> {
   @override
   Widget build(BuildContext context) {
     final theme = Theme.of(context);
+    final isLinked = _linkedInventoryId != null;
+
     return MainLayout(
       currentUser: widget.currentUser, currentPage: 'menu',
       child: Scaffold(
@@ -203,21 +251,38 @@ class _AddProductState extends State<AddProduct> {
                   const SizedBox(height: 25),
                   Row(
                     children: [
-                      Expanded(child: TextField(controller: nameController, decoration: AppComponents.fieldInput("اسم المنتج", Icons.fastfood_outlined))),
+                      Expanded(child: TextField(
+                        controller: nameController, 
+                        readOnly: isLinked,
+                        decoration: AppComponents.fieldInput("اسم المنتج", isLinked ? Icons.lock_outline : Icons.fastfood_outlined)
+                      )),
                       const SizedBox(width: 10),
                       IconButton.filledTonal(onPressed: _isEditMode ? null : _linkExistingInventory, icon: const Icon(Icons.link), tooltip: "ربط مع صنف من المخزن"),
                     ],
                   ),
+                  if (isLinked)
+                    const Padding(
+                      padding: EdgeInsets.only(top: 8, right: 12),
+                      child: Text("هذا المنتج مرتبط بالمخزن، يتم تحديث البيانات تلقائياً.", style: TextStyle(color: Colors.blueGrey, fontSize: 10, fontStyle: FontStyle.italic)),
+                    ),
                   const SizedBox(height: 15),
+                  
                   TextField(
                     controller: barcodeController, 
                     decoration: InputDecoration(
-                      labelText: "الباركود",
+                      labelText: "الباركود (رقم علبة الكولا مثلاً)",
                       prefixIcon: const Icon(Icons.qr_code_scanner),
-                      filled: true, fillColor: Colors.grey[100],
+                      suffixIcon: IconButton(
+                        icon: const Icon(Icons.camera_alt_rounded, color: Colors.blue),
+                        onPressed: _scanBarcode,
+                        tooltip: "مسح بالكاميرا",
+                      ),
+                      filled: true, fillColor: Colors.grey[50],
                       border: OutlineInputBorder(borderRadius: BorderRadius.circular(15), borderSide: BorderSide.none),
+                      helperText: "يمكنك كتابة الرقم يدوياً أو استخدام القارئ",
                     )
                   ),
+                  
                   const SizedBox(height: 25),
                   const Text("بيانات التسعير والربح", style: TextStyle(fontWeight: FontWeight.bold, fontSize: 16)),
                   const SizedBox(height: 10),
@@ -227,15 +292,30 @@ class _AddProductState extends State<AddProduct> {
                     value: isManualPrice, activeColor: theme.primaryColor,
                     onChanged: (v) => setState(() => isManualPrice = v),
                   ),
-                  if (!isManualPrice) ...[
-                    Row(
-                      children: [
-                        Expanded(child: TextField(controller: costPriceController, keyboardType: TextInputType.number, decoration: AppComponents.fieldInput("سعر التكلفة", Icons.shopping_bag_outlined))),
-                        const SizedBox(width: 10),
+                  const SizedBox(height: 10),
+                  Row(
+                    children: [
+                      Expanded(child: Column(
+                        crossAxisAlignment: CrossAxisAlignment.start,
+                        children: [
+                          TextField(
+                            controller: costPriceController, 
+                            readOnly: isLinked,
+                            keyboardType: TextInputType.number, 
+                            decoration: AppComponents.fieldInput("سعر التكلفة", isLinked ? Icons.lock_clock_outlined : Icons.shopping_bag_outlined)
+                          ),
+                          if (isLinked)
+                            const Padding(
+                              padding: EdgeInsets.only(top: 4, right: 8),
+                              child: Text("التكلفة ممررة من المخزن (WAC)", style: TextStyle(color: Colors.orange, fontSize: 9, fontWeight: FontWeight.bold)),
+                            ),
+                        ],
+                      )),
+                      const SizedBox(width: 10),
+                      if (!isManualPrice)
                         Expanded(child: TextField(controller: priceController, keyboardType: TextInputType.number, decoration: AppComponents.fieldInput("سعر البيع", Icons.sell_outlined))),
-                      ],
-                    ),
-                  ],
+                    ],
+                  ),
                   const SizedBox(height: 25),
                   const Text("الضرائب والتكاليف الإضافية", style: TextStyle(fontWeight: FontWeight.bold, fontSize: 16)),
                   const SizedBox(height: 10),

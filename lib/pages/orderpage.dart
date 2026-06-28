@@ -3,6 +3,7 @@ import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:cloud_firestore/cloud_firestore.dart';
 import 'package:intl/intl.dart' as intl;
+import 'package:ai_barcode_scanner/ai_barcode_scanner.dart';
 import '../services/order_service.dart';
 import '../services/inventory_service.dart';
 import '../services/debt_service.dart';
@@ -13,6 +14,7 @@ import '../widgets/app_components.dart';
 import '../widgets/category_grid_view.dart';
 import 'user_model.dart';
 import 'addproduct.dart';
+import 'homepage.dart';
 
 class OrderPage extends StatefulWidget {
   final User currentUser;
@@ -64,11 +66,16 @@ class _OrderPageState extends State<OrderPage> with TickerProviderStateMixin {
   String? _selectedCustomerBalance;
   double? _selectedCustomerLimit;
 
-  List<DocumentSnapshot> _allProducts = [];
+  List<QueryDocumentSnapshot> _allProducts = [];
   Map<String, dynamic>? _tableData;
   double _currentTimerPrice = 0.0;
+  String? _pendingInitialBarcode;
 
   Stream<QuerySnapshot>? _pendingOrdersStream;
+
+  // Scanner status logic
+  bool _isScannerConnected = false;
+  late AnimationController _pulseController;
 
   @override
   void initState() {
@@ -80,15 +87,51 @@ class _OrderPageState extends State<OrderPage> with TickerProviderStateMixin {
     _timerTick = Timer.periodic(const Duration(seconds: 10), (timer) {
       if (mounted) _calculateTimerPrice();
     });
+
+    _pulseController = AnimationController(
+      vsync: this,
+      duration: const Duration(seconds: 2),
+    )..repeat(reverse: true);
+
+    _barcodeFieldFocusNode.addListener(() {
+      if (mounted) {
+        setState(() {
+          _isScannerConnected = _barcodeFieldFocusNode.hasFocus;
+        });
+      }
+    });
+
+    // إضافة مستمع عالمي للوحة المفاتيح داخل الصفحة لالتقاط الماسح في أي وقت
+    HardwareKeyboard.instance.addHandler(_onGlobalKeyEvent);
+  }
+
+  bool _onGlobalKeyEvent(KeyEvent event) {
+    if (!mounted) return false;
+    // إذا لم يكن التركيز على أي حقل نصي، نقوم بنقل التركيز تلقائياً لحقل الباركود
+    if (event is KeyDownEvent && !_barcodeFieldFocusNode.hasFocus &&
+        !FocusScope.of(context).hasFocus) {
+       _barcodeFieldFocusNode.requestFocus();
+    }
+    return false;
   }
 
   void _restoreOrder(Map<String, dynamic> data) {
     Map<String, Map<String, dynamic>> restoredCart = {};
-    for (var item in (data['items'] as List)) restoredCart[item['id']] = Map<String, dynamic>.from(item);
+    final items = data['items'];
+    if (items != null && items is List) {
+      for (var item in items) {
+        if (item is Map && item['id'] != null) {
+          restoredCart[item['id'].toString()] = Map<String, dynamic>.from(item);
+        }
+      }
+    }
     cartNotifier.value = restoredCart;
-    _nameController.text = data['customer_name'] ?? "";
-    _phoneController.text = data['customer_phone'] ?? "";
-    _selectedCustomerId = data['selectedCustomerId'];
+    _nameController.text = data['customer_name']?.toString() ?? "";
+    _phoneController.text = data['customer_phone']?.toString() ?? "";
+    _selectedCustomerId = data['selectedCustomerId']?.toString();
+
+    // حفظ الباركود القادم من الخارج لمعالجته بعد تحميل المنتجات
+    _pendingInitialBarcode = data['initial_barcode']?.toString();
   }
 
   void _onSearchChanged() {
@@ -160,14 +203,46 @@ class _OrderPageState extends State<OrderPage> with TickerProviderStateMixin {
         .where('parentId', isEqualTo: managerId)
         .snapshots()
         .listen((snap) {
-          if (mounted) setState(() => _allProducts = snap.docs);
+          if (mounted) {
+            setState(() => _allProducts = snap.docs);
+
+            // إذا كان هناك باركود معلق قادم من الخارج، نقوم بمعالجته الآن
+            if (_pendingInitialBarcode != null) {
+              final code = _pendingInitialBarcode!;
+              _pendingInitialBarcode = null;
+              Future.microtask(() => _onBarcodeScanned(code));
+            }
+          }
         }, onError: (e) => debugPrint("Products Stream Error: $e"));
+  }
+
+  Future<void> _openCameraScanner() async {
+    await Navigator.of(context).push(
+      MaterialPageRoute(
+        builder: (context) => AiBarcodeScanner(
+          onDetect: (BarcodeCapture capture) {
+            final String? value = capture.barcodes.first.rawValue;
+            if (value != null) {
+              _onBarcodeScanned(value);
+              Navigator.of(context).pop();
+            }
+          },
+        ),
+      ),
+    );
   }
 
   void _onBarcodeScanned(String code) {
     if (!mounted) return;
     final cleanCode = code.trim();
     if (cleanCode.isEmpty) return;
+
+    // 1. تحديد مكان كتابة الباركود ولصق الرقم وتحديث الفلترة المرئية
+    _barcodeInputController.text = cleanCode;
+    _searchController.clear(); // مسح البحث النصي العادي
+    searchNotifier.value = cleanCode.toLowerCase(); // تفعيل الفلترة بالباركود ليظهر عنصر واحد
+
+    debugPrint("🔍 جاري المعالجة التلقائية للباركود: $cleanCode");
 
     try {
       final doc = _allProducts.firstWhere(
@@ -178,22 +253,64 @@ class _OrderPageState extends State<OrderPage> with TickerProviderStateMixin {
       );
 
       final data = doc.data() as Map<String, dynamic>;
-      _updateCart(doc.id, data, (cartNotifier.value[doc.id]?['quantity'] ?? 0.0) + 1);
+      final String id = doc.id;
 
-      HapticFeedback.lightImpact();
-      _barcodeInputController.clear();
+      double availableStock = inventoryNotifier.value[id] ?? (data['stockQuantity'] as num? ?? 0.0).toDouble();
+      double currentInCart = cartNotifier.value[id]?['quantity'] ?? 0.0;
 
-      ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(content: Text("✅ تمت إضافة: ${data['name']}"), duration: const Duration(milliseconds: 800), backgroundColor: Colors.green)
-      );
+      // 2. التحقق من المخزن والإضافة التلقائية للسلة
+      if (currentInCart + 1 > availableStock && (_settings?.isInventoryTrackingEnabled ?? true)) {
+         HapticFeedback.vibrate();
+         ScaffoldMessenger.of(context).showSnackBar(
+           SnackBar(
+             content: Text("⚠️ مخزن غير كافٍ لـ: ${data['name']}"),
+             backgroundColor: Colors.red[800],
+             behavior: SnackBarBehavior.floating,
+           )
+         );
+      } else {
+         _updateCart(id, data, currentInCart + 1);
+
+         HapticFeedback.mediumImpact();
+         ScaffoldMessenger.of(context).clearSnackBars();
+         ScaffoldMessenger.of(context).showSnackBar(
+           SnackBar(
+             content: Row(
+               children: [
+                 const Icon(Icons.check_circle, color: Colors.white, size: 20),
+                 const SizedBox(width: 10),
+                 Expanded(child: Text("تمت إضافة ${data['name']} بنجاح")),
+               ],
+             ),
+             duration: const Duration(milliseconds: 1500),
+             backgroundColor: Colors.green[800],
+             behavior: SnackBarBehavior.floating,
+             shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(10)),
+             margin: const EdgeInsets.all(10),
+           )
+         );
+      }
+
+      // 3. الحفاظ على استقرار الصفحة: نبقي رقم الباركود في الحقل ليبقى العنصر ظاهراً
+      // ولا نقوم بمسح `_barcodeInputController` هنا بل نجعله جاهزاً للاختيار القادم
+      _barcodeInputController.selection = TextSelection(baseOffset: 0, extentOffset: cleanCode.length);
+
     } catch (e) {
+      debugPrint("❌ لم يتم العثور على المنتج بالباركود: $cleanCode");
+      HapticFeedback.vibrate();
       ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(content: Text("❌ الباركود $cleanCode غير مسجل!"), backgroundColor: Colors.orange)
+        SnackBar(
+          content: Text("❌ الصنف ($cleanCode) غير موجود في النظام"),
+          backgroundColor: Colors.orange[800],
+          behavior: SnackBarBehavior.floating,
+        )
       );
-      _barcodeInputController.clear();
     }
 
-    _barcodeFieldFocusNode.requestFocus();
+    // إبقاء التركيز جاهزاً للقراءة التالية
+    Future.microtask(() {
+      if (mounted) _barcodeFieldFocusNode.requestFocus();
+    });
   }
 
   void _listenToAllTables(String cid, String managerId) {
@@ -207,7 +324,9 @@ class _OrderPageState extends State<OrderPage> with TickerProviderStateMixin {
     _inventorySub = InventoryService.streamInventory(cid, managerId).listen((items) {
       if (mounted) {
         Map<String, double> stocks = {};
-        for (var item in items) stocks[item['id']] = (item['quantity'] ?? 0.0).toDouble();
+        for (var item in items) {
+          stocks[item['id']] = (item['quantity'] ?? 0.0).toDouble();
+        }
         inventoryNotifier.value = stocks;
       }
     });
@@ -249,7 +368,8 @@ class _OrderPageState extends State<OrderPage> with TickerProviderStateMixin {
     bool isTrackingEnabled = _settings?.isInventoryTrackingEnabled ?? true;
 
     if (isTrackingEnabled && qty > currentQtyInCart && !id.startsWith('custom_')) {
-      double stock = (data['stockQuantity'] as num? ?? 0.0).toDouble();
+      double stock = inventoryNotifier.value[id] ?? (data['stockQuantity'] as num? ?? 0.0).toDouble();
+
       if (qty > stock) {
         ScaffoldMessenger.of(context).showSnackBar(
           SnackBar(content: Text("⚠️ الصنف (${data['name']}) مخلص أو الكمية غير كافية في المخزن (المتوفر: $stock)"), backgroundColor: Colors.red, duration: const Duration(seconds: 2))
@@ -273,11 +393,15 @@ class _OrderPageState extends State<OrderPage> with TickerProviderStateMixin {
     }
 
     final currentCart = Map<String, Map<String, dynamic>>.from(cartNotifier.value);
-    if (qty <= 0) currentCart.remove(id);
-    else {
+    if (qty <= 0) {
+      currentCart.remove(id);
+    } else {
       double price = (double.tryParse(data['price'].toString()) ?? 0.0);
       double taxPercent = (double.tryParse(data['tax']?.toString() ?? "0") ?? 0.0);
       double extraCosts = (double.tryParse(data['extraCosts']?.toString() ?? "0") ?? 0.0);
+
+      double costAtSale = (double.tryParse(data['lastCostPrice']?.toString() ?? "") ??
+                           double.tryParse(data['costPrice']?.toString() ?? "0") ?? 0.0);
 
       double baseWithExtra = price + extraCosts;
       double totalWithTax = baseWithExtra * (1 + (taxPercent / 100));
@@ -288,6 +412,8 @@ class _OrderPageState extends State<OrderPage> with TickerProviderStateMixin {
         ...data,
         'quantity': qty,
         'price': price,
+        'costPrice': costAtSale,
+        'costPriceAtSale': costAtSale,
         'tax': taxPercent,
         'extraCosts': extraCosts,
         'extraDetails': data['extraDetails'] ?? "",
@@ -328,6 +454,7 @@ class _OrderPageState extends State<OrderPage> with TickerProviderStateMixin {
         _phoneController.clear();
         _barcodeInputController.clear();
         _receivedAmountController.clear();
+        searchNotifier.value = "";
         _selectedCustomerId = null;
         _selectedCustomerBalance = null;
         _selectedCustomerLimit = null;
@@ -345,7 +472,7 @@ class _OrderPageState extends State<OrderPage> with TickerProviderStateMixin {
           if (!mounted) return;
           cartNotifier.value = {};
           ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text("✅ تم تصفير الطاولة وإغلاقها"), backgroundColor: Colors.green));
-          Navigator.pop(context);
+          _onBackTap();
         } catch (e) {
           if (mounted) ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text("❌ خطأ في النظام: $e"), backgroundColor: Colors.red));
         }
@@ -410,6 +537,7 @@ class _OrderPageState extends State<OrderPage> with TickerProviderStateMixin {
                   _updateCart(customId, {
                     'name': name,
                     'price': price,
+                    'costPrice': 0.0,
                     'category': 'يدوي',
                     'image': '',
                   }, 1);
@@ -473,7 +601,7 @@ class _OrderPageState extends State<OrderPage> with TickerProviderStateMixin {
           content: Text("هل أنت متأكد من نقل حساب ($sourceName) إلى (${widget.tableName})؟ سيتم إغلاق طاولة $sourceName."),
           actions: [
             TextButton(onPressed: () => Navigator.pop(ctx, false), child: const Text("إلغاء")),
-            TextButton(onPressed: () => Navigator.pop(ctx, true), child: const Text("تأكيد النقل", style: TextStyle(color: Colors.orange, fontWeight: FontWeight.bold))),
+            TextButton(onPressed: () => Navigator.pop(ctx, true), child: Text("تأكيد النقل", style: TextStyle(color: Colors.orange, fontWeight: FontWeight.bold))),
           ],
         ),
       ),
@@ -506,7 +634,7 @@ class _OrderPageState extends State<OrderPage> with TickerProviderStateMixin {
     showDialog(
       context: context,
       builder: (ctx) => StatefulBuilder(
-        builder: (context, setDialogState) => Directionality(
+        builder: (contextDialog, setDialogState) => Directionality(
           textDirection: TextDirection.rtl,
           child: AlertDialog(
             title: const Text("نقل الصنف لطاولة أخرى"),
@@ -525,7 +653,7 @@ class _OrderPageState extends State<OrderPage> with TickerProviderStateMixin {
                        final data = d.data() as Map;
                        return data['name'] != widget.tableName;
                     }).toList();
-                    
+
                     if (tables.isEmpty) return const Text("لا توجد طاولات أخرى متاحة");
 
                     return DropdownButtonFormField<String>(
@@ -557,7 +685,7 @@ class _OrderPageState extends State<OrderPage> with TickerProviderStateMixin {
                 onPressed: (selectedTargetTable != null) ? () async {
                   try {
                     Navigator.pop(ctx);
-                    final List<Map<String, dynamic>> itemsToMove = [
+                    final List<Map<String, dynamic>> itemsToTransfer = [
                       {
                         ...item,
                         'quantity': qtyToMove,
@@ -567,12 +695,16 @@ class _OrderPageState extends State<OrderPage> with TickerProviderStateMixin {
                     await OrderService.transferItems(
                       sourceOrderId: item['orderId'],
                       targetTableName: selectedTargetTable!,
-                      itemsToTransfer: itemsToMove,
+                      itemsToTransfer: itemsToTransfer,
                       currentUser: widget.currentUser,
                     );
-                    ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text("✅ تم نقل الصنف بنجاح"), backgroundColor: Colors.green));
+                    if (mounted) {
+                      ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text("✅ تم نقل الصنف بنجاح"), backgroundColor: Colors.green));
+                    }
                   } catch (e) {
-                    ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text("❌ خطأ: $e"), backgroundColor: Colors.red));
+                    if (mounted) {
+                      ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text("❌ خطأ: $e"), backgroundColor: Colors.red));
+                    }
                   }
                 } : null,
                 child: const Text("تأكيد النقل"),
@@ -584,8 +716,18 @@ class _OrderPageState extends State<OrderPage> with TickerProviderStateMixin {
     );
   }
 
+  void _onBackTap() {
+    if (Navigator.canPop(context)) {
+      Navigator.pop(context);
+    } else {
+      Navigator.pushReplacement(context, MaterialPageRoute(builder: (_) => HomePage(currentUser: widget.currentUser)));
+    }
+  }
+
   @override
   void dispose() {
+    HardwareKeyboard.instance.removeHandler(_onGlobalKeyEvent);
+    _pulseController.dispose();
     _debounce?.cancel();
     _timerTick?.cancel();
     _searchController.dispose();
@@ -594,6 +736,7 @@ class _OrderPageState extends State<OrderPage> with TickerProviderStateMixin {
     _receivedAmountController.dispose();
     _barcodeInputController.dispose();
     _barcodeFieldFocusNode.dispose();
+    _tabController?.dispose();
     _settingsSub?.cancel();
     _inventorySub?.cancel();
     _debtSub?.cancel();
@@ -665,16 +808,19 @@ class _OrderPageState extends State<OrderPage> with TickerProviderStateMixin {
       child: Column(
         children: [
           Row(children: [
-            IconButton(icon: const Icon(Icons.arrow_back_ios, color: Colors.white, size: 20), onPressed: () => Navigator.pop(context)),
-            Text(widget.tableName, style: const TextStyle(color: Colors.white, fontSize: 18, fontWeight: FontWeight.bold)),
+            IconButton(icon: const Icon(Icons.arrow_back_ios, color: Colors.white, size: 20), onPressed: _onBackTap),
+            Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text(widget.tableName, style: const TextStyle(color: Colors.white, fontSize: 18, fontWeight: FontWeight.bold)),
+                _buildScannerStatus(),
+              ],
+            ),
             const Spacer(),
             IconButton(
-              icon: const Icon(Icons.qr_code_scanner, color: Colors.white, size: 28),
-              onPressed: () {
-                _barcodeFieldFocusNode.requestFocus();
-                ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text("جهاز المسح جاهز..."), duration: Duration(milliseconds: 700)));
-              },
-              tooltip: "تفعيل الماسح"
+              icon: const Icon(Icons.camera_alt_rounded, color: Colors.white, size: 28),
+              onPressed: _openCameraScanner,
+              tooltip: "فتح الكاميرا للمسح"
             ),
             if (widget.currentUser.canDeleteOrders)
               IconButton(
@@ -702,6 +848,40 @@ class _OrderPageState extends State<OrderPage> with TickerProviderStateMixin {
           ]),
         ],
       ),
+    );
+  }
+
+  Widget _buildScannerStatus() {
+    return Row(
+      mainAxisSize: MainAxisSize.min,
+      children: [
+        AnimatedBuilder(
+          animation: _pulseController,
+          builder: (context, child) {
+            return Container(
+              width: 7, height: 7,
+              decoration: BoxDecoration(
+                shape: BoxShape.circle,
+                color: _isScannerConnected ? Colors.greenAccent : Colors.white24,
+                boxShadow: _isScannerConnected ? [
+                  BoxShadow(
+                    color: Colors.greenAccent.withOpacity(0.4 * _pulseController.value),
+                    blurRadius: 10, spreadRadius: 3,
+                  )
+                ] : null,
+              ),
+            );
+          },
+        ),
+        const SizedBox(width: 5),
+        Text(
+          _isScannerConnected ? "جاهز للمسح" : "بانتظار تفعيل البحث",
+          style: TextStyle(
+            color: _isScannerConnected ? Colors.greenAccent : Colors.white60,
+            fontSize: 9, fontWeight: FontWeight.bold,
+          ),
+        ),
+      ],
     );
   }
 
@@ -742,10 +922,20 @@ class _OrderPageState extends State<OrderPage> with TickerProviderStateMixin {
               onSubmitted: _onBarcodeScanned,
               decoration: InputDecoration(
                 hintText: "الباركود...",
-                prefixIcon: const Icon(Icons.barcode_reader),
+                prefixIcon: Icon(
+                  Icons.barcode_reader,
+                  color: _isScannerConnected ? Colors.green : Colors.blueGrey[300],
+                ),
+                suffixIcon: IconButton(
+                  icon: const Icon(Icons.camera_alt, color: Colors.blue, size: 18),
+                  onPressed: _openCameraScanner,
+                ),
                 filled: true,
-                fillColor: Colors.blue[50],
-                border: OutlineInputBorder(borderRadius: BorderRadius.circular(12), borderSide: BorderSide(color: Colors.blue.withOpacity(0.2))),
+                fillColor: _isScannerConnected ? Colors.green[50] : Colors.blue[50],
+                border: OutlineInputBorder(
+                  borderRadius: BorderRadius.circular(12),
+                  borderSide: BorderSide(color: _isScannerConnected ? Colors.green.withOpacity(0.2) : Colors.blue.withOpacity(0.1))
+                ),
                 contentPadding: const EdgeInsets.symmetric(vertical: 0),
               ),
             ),
@@ -756,47 +946,57 @@ class _OrderPageState extends State<OrderPage> with TickerProviderStateMixin {
   }
 
   Widget _buildProductSection() {
-    final String cafeId = _activeCafeId ?? widget.currentUser.cafeId;
-    final String managerId = widget.currentUser.parentId ?? widget.currentUser.id;
-    return StreamBuilder<QuerySnapshot>(
-        stream: FirebaseFirestore.instance.collection('products').where('cafeId', isEqualTo: cafeId).where('parentId', isEqualTo: managerId).snapshots(),
-        builder: (context, snapshot) {
-          if (!snapshot.hasData) return const Center(child: CircularProgressIndicator());
-          final allDocs = snapshot.data!.docs;
-          final categories = ["الكل", ...allDocs.map((d) => (d.data() as Map)['category']?.toString() ?? "عام").toSet().toList()..sort()];
+    final allDocs = _allProducts;
+    final categories = [
+      "الكل",
+      ...allDocs
+          .map((d) => (d.data() as Map)['category']?.toString() ?? "عام")
+          .toSet()
+          .toList()
+        ..sort()
+    ];
 
-          if (_tabController == null || _tabController!.length != categories.length) {
-            _tabController = TabController(length: categories.length, vsync: this);
-          }
+    if (_tabController == null || _tabController!.length != categories.length) {
+      _tabController?.dispose();
+      _tabController = TabController(length: categories.length, vsync: this);
+    }
 
-          return Column(children: [
-            TabBar(
-              controller: _tabController,
-              isScrollable: true,
-              labelColor: Colors.blue[900],
-              unselectedLabelColor: Colors.grey,
-              indicatorColor: Colors.blue[900],
-              tabs: categories.map((cat) => Tab(text: cat)).toList(),
-            ),
-            Expanded(child: TabBarView(
-              controller: _tabController,
-              children: categories.map<Widget>((cat) => CategoryGridView(
-                category: cat,
-                allDocs: allDocs,
-                searchNotifier: searchNotifier,
-                cartNotifier: cartNotifier,
-                inventoryNotifier: inventoryNotifier,
-                onProductTap: (id, data, q) => _updateCart(id, data, q),
-                onProductLongPress: (id, data) {
-                  if (widget.currentUser.canEditMenu) {
-                    Navigator.push(context, MaterialPageRoute(builder: (_) => AddProduct(currentUser: widget.currentUser, productToEdit: {'id': id, ...data})));
-                  }
-                },
-              )).toList(),
-            ))
-          ]);
-        }
-    );
+    return Column(children: [
+      TabBar(
+        controller: _tabController,
+        isScrollable: true,
+        labelColor: Colors.blue[900],
+        unselectedLabelColor: Colors.grey,
+        indicatorColor: Colors.blue[900],
+        tabs: categories.map((cat) => Tab(text: cat)).toList(),
+      ),
+      Expanded(
+        child: TabBarView(
+          controller: _tabController,
+          children: categories.map<Widget>((cat) => CategoryGridView(
+            category: cat,
+            allDocs: allDocs,
+            searchNotifier: searchNotifier,
+            cartNotifier: cartNotifier,
+            inventoryNotifier: inventoryNotifier,
+            onProductTap: (id, data, q) => _updateCart(id, data, q),
+            onProductLongPress: (id, data) {
+              if (widget.currentUser.canEditMenu) {
+                Navigator.push(
+                  context,
+                  MaterialPageRoute(
+                    builder: (_) => AddProduct(
+                      currentUser: widget.currentUser,
+                      productToEdit: {'id': id, ...data},
+                    ),
+                  ),
+                );
+              }
+            },
+          )).toList(),
+        ),
+      ),
+    ]);
   }
 
   Widget _buildInvoiceSide() {
@@ -936,7 +1136,7 @@ class _OrderPageState extends State<OrderPage> with TickerProviderStateMixin {
                                               ),
                                           ],
                                         ),
-                                        actions: [TextButton(onPressed: () => Navigator.pop(context), child: const Text("إغلاق"))]
+                                        actions: [TextButton(onPressed: () => Navigator.pop(context), child: const Text("إلغاء"))]
                                       );
                                     },
                                     child: const Icon(Icons.info_outline, size: 14, color: Colors.orange),
@@ -976,9 +1176,9 @@ class _OrderPageState extends State<OrderPage> with TickerProviderStateMixin {
           final bool isTakeaway = widget.tableId == "takeaway";
 
           final bool canShowPayment = widget.currentUser.canPayOrders && (
-            widget.currentUser.role == UserRole.super_admin || 
-            widget.currentUser.role == UserRole.admin || 
-            widget.currentUser.role == UserRole.manager || 
+            widget.currentUser.role == UserRole.super_admin ||
+            widget.currentUser.role == UserRole.admin ||
+            widget.currentUser.role == UserRole.manager ||
             widget.currentUser.role == UserRole.cashier ||
             widget.currentUser.role == UserRole.custom
           );
@@ -1038,6 +1238,10 @@ class _OrderPageState extends State<OrderPage> with TickerProviderStateMixin {
       }
     ];
 
+    String? surplusRecipientId;
+    String? surplusRecipientName;
+    String? surplusRecipientPhone;
+
     showModalBottomSheet(
       context: context,
       isScrollControlled: true,
@@ -1095,6 +1299,50 @@ class _OrderPageState extends State<OrderPage> with TickerProviderStateMixin {
                     ),
                   ),
 
+                  const Divider(height: 20),
+                  const Row(
+                    children: [
+                      Icon(Icons.person_add_alt, color: Colors.orange, size: 20),
+                      SizedBox(width: 8),
+                      Text("إضافة الرصيد المتبقي في رصيد الصديق (اختياري)", style: TextStyle(fontWeight: FontWeight.bold, color: Colors.orange, fontSize: 13)),
+                    ],
+                  ),
+                  const SizedBox(height: 8),
+                  Autocomplete<Map<String, String>>(
+                    displayStringForOption: (option) => option['name']!,
+                    optionsBuilder: (textEditingValue) {
+                      if (textEditingValue.text.isEmpty) return const Iterable.empty();
+                      final q = textEditingValue.text.toLowerCase();
+                      return _customerSuggestions.where((c) => c['name']!.toLowerCase().contains(q));
+                    },
+                    onSelected: (selection) {
+                      setDialogState(() {
+                        surplusRecipientId = selection['id'];
+                        surplusRecipientName = selection['name'];
+                        surplusRecipientPhone = selection['phone'];
+                      });
+                    },
+                    fieldViewBuilder: (context, controller, focusNode, onFieldSubmitted) {
+                      return TextField(
+                        controller: controller,
+                        focusNode: focusNode,
+                        decoration: AppComponents.fieldInput("ابحث عن صديق لتحويل الفائض له...", Icons.person_search),
+                      );
+                    },
+                  ),
+                  if (surplusRecipientName != null)
+                    Padding(
+                      padding: const EdgeInsets.only(top: 8.0),
+                      child: Chip(
+                        label: Text("الفائض سيذهب لـ: $surplusRecipientName", style: const TextStyle(fontSize: 11)),
+                        onDeleted: () => setDialogState(() {
+                          surplusRecipientId = null;
+                          surplusRecipientName = null;
+                        }),
+                        backgroundColor: Colors.orange[50],
+                      ),
+                    ),
+
                   const Divider(height: 30),
 
                   Container(
@@ -1122,7 +1370,12 @@ class _OrderPageState extends State<OrderPage> with TickerProviderStateMixin {
                       minimumSize: const Size(double.infinity, 55),
                       shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(15))
                     ),
-                    onPressed: () => _handleMultiPayerSubmission(context, total, totalReceived, payers, ctx),
+                    onPressed: () => _handleMultiPayerSubmission(
+                      context, total, totalReceived, payers, ctx,
+                      friendId: surplusRecipientId,
+                      friendName: surplusRecipientName,
+                      friendPhone: surplusRecipientPhone
+                    ),
                     icon: const Icon(Icons.check_circle),
                     label: const Text("تأكيد العملية وتسجيل الحوالات", style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold)),
                   ),
@@ -1283,7 +1536,10 @@ class _OrderPageState extends State<OrderPage> with TickerProviderStateMixin {
     );
   }
 
-  Future<void> _handleMultiPayerSubmission(BuildContext context, double total, double totalReceived, List<Map<String, dynamic>> payers, BuildContext ctx) async {
+  Future<void> _handleMultiPayerSubmission(
+    BuildContext context, double total, double totalReceived, List<Map<String, dynamic>> payers, BuildContext ctx,
+    {String? friendId, String? friendName, String? friendPhone}
+  ) async {
     for (var p in payers) {
       if (p['method'] == "دين" && p['limit'] != null && p['limit'] > 0) {
         double amt = double.tryParse(p['amountController'].text.trim()) ?? 0;
@@ -1314,7 +1570,7 @@ class _OrderPageState extends State<OrderPage> with TickerProviderStateMixin {
        String title = diff > 0 ? "تأكيد تسجيل متبقي (دين)" : "تأكيد تسجيل فائض (رصيد)";
        String content = diff > 0
           ? "يوجد مبلغ متبقي ${diff.round()} ₪ لم يغطى. هل تريد تسجيله كدين إضافي على $mainCustomer؟"
-          : "يوجد مبلغ زائد ${diff.abs().round()} ₪. هل تريد تسجيله كرصيد لصالح $mainCustomer؟";
+          : "يوجد مبلغ زائد ${diff.abs().round()} ₪. هل تريد تسجيله كرصيد؟";
 
        bool? confirm = await showDialog<bool>(
          context: context,
@@ -1332,15 +1588,18 @@ class _OrderPageState extends State<OrderPage> with TickerProviderStateMixin {
        );
        if (confirm == null) return;
        if (ctx.mounted) Navigator.pop(ctx);
-       _submitOrderMultiPayer(total, totalReceived, payers, confirm);
+       _submitOrderMultiPayer(total, totalReceived, payers, confirm, friendId: friendId, friendName: friendName, friendPhone: friendPhone);
        return;
     }
 
     if (ctx.mounted) Navigator.pop(ctx);
-    _submitOrderMultiPayer(total, totalReceived, payers, true);
+    _submitOrderMultiPayer(total, totalReceived, payers, true, friendId: friendId, friendName: friendName, friendPhone: friendPhone);
   }
 
-  void _submitOrderMultiPayer(double total, double totalReceived, List<Map<String, dynamic>> payers, bool recordBalanceChange) async {
+  void _submitOrderMultiPayer(
+    double total, double totalReceived, List<Map<String, dynamic>> payers, bool recordBalanceChange,
+    {String? friendId, String? friendName, String? friendPhone}
+  ) async {
     final String cafeId = _activeCafeId ?? widget.currentUser.cafeId;
 
     try {
@@ -1353,51 +1612,96 @@ class _OrderPageState extends State<OrderPage> with TickerProviderStateMixin {
         skipSync: true, skipPaymentRecord: true,
         timerPrice: _currentTimerPrice,
       );
-      
-      final List allItems = result['items'] ?? [];
 
-      double totalDebtRegisteredDirectly = 0;
-      double totalLiquidRegistered = 0;
+      final List allItems = result['items'] ?? [];
+      String itemsSummary = allItems.map((it) => "${it['quantity'] ?? 1}x ${it['name'] ?? 'صنف'}").join("، ");
+      double remainingInvoice = total;
 
       for (int i = 0; i < payers.length; i++) {
         var p = payers[i];
-        double amt = (double.tryParse(p['amountController'].text.trim()) ?? 0).roundToDouble();
-        if (amt <= 0) continue;
+        double totalAmt = (double.tryParse(p['amountController'].text.trim()) ?? 0).roundToDouble();
+        if (totalAmt <= 0 && p['method'] != "دين") continue;
 
         String pName = p['nameController'].text.trim().isEmpty ? "زبون عام" : p['nameController'].text.trim();
         String pPhone = p['phoneController'].text.trim();
         String? pId = p['id'];
         String pMethod = p['method'];
 
-        if (pMethod == "دين") totalDebtRegisteredDirectly += amt;
-        else totalLiquidRegistered += amt;
+        if (pMethod.contains( "دين")||pMethod.contains('ديون')) {
+          remainingInvoice -= totalAmt;
+          await TransferService.performSave(
+            context: context,
+            currentUser: widget.currentUser,
+            customerName: pName,
+            phone: pPhone,
+            amt: totalAmt,
+            method: pMethod,
+            items: allItems,
+            selectedDebtId: pId,
+            cafeId: cafeId,
+            table: widget.tableName,
+            note: "فاتورة ${widget.tableName}: $itemsSummary",
+            skipSync: false,
+          );
+        } else {
+          double contribution = 0;
+          double surplus = 0;
 
-        TransferService.performSave(
-          context: context, currentUser: widget.currentUser, customerName: pName,
-          phone: pPhone, amt: amt, method: pMethod,
-          cafeId: cafeId, isDebtPayment: false, selectedDebtId: pId,
-          table: widget.tableName, note: "مشاركة دفع في فاتورة بقيمة ${total.round()}",
-          skipSync: false,
-          items: i == 0 ? allItems : [], 
-        );
+          if (remainingInvoice > 0) {
+            contribution = totalAmt > remainingInvoice ? remainingInvoice : totalAmt;
+            surplus = totalAmt - contribution;
+            remainingInvoice -= contribution;
+          } else {
+            surplus = totalAmt;
+          }
+
+          if (contribution > 0) {
+            await TransferService.performSave(
+              context: context, currentUser: widget.currentUser, customerName: pName,
+              phone: pPhone, amt: contribution, method: pMethod,
+              cafeId: cafeId, isDebtPayment: false, selectedDebtId: pId,
+              table: widget.tableName, note: "مشاركة دفع (${widget.tableName}): $itemsSummary",
+              skipSync: true,
+              items: i == 0 ? allItems : [],
+            );
+          }
+
+          if (surplus > 0) {
+            String recipientName = (friendName != null && friendName.isNotEmpty) ? friendName : pName;
+            String? recipientId = (friendName != null && friendName.isNotEmpty) ? friendId : pId;
+            String recipientPhone = (friendName != null && friendName.isNotEmpty) ? (friendPhone ?? "") : pPhone;
+
+            await TransferService.performSave(
+              context: context, currentUser: widget.currentUser, customerName: recipientName,
+              phone: recipientPhone, amt: surplus, method: pMethod,
+              cafeId: cafeId, isDebtPayment: recordBalanceChange, selectedDebtId: recipientId,
+              table: widget.tableName, note: "سداد رصيد زائد من فاتورة ${widget.tableName}${friendName != null ? ' (دفع بواسطة $pName)' : ''}",
+              skipSync: !recordBalanceChange,
+              items: [],
+            );
+          }
+        }
       }
 
-      double unpaidDiff = (total - totalLiquidRegistered - totalDebtRegisteredDirectly).roundToDouble();
-      String mainCustomer = payers[0]['nameController'].text.trim();
-      String mainPhone = payers[0]['phoneController'].text.trim();
-
-      if (mainCustomer != "زبون عام" && recordBalanceChange && unpaidDiff.abs() > 0.01) {
-        TransferService.syncWithDebts(
-          currentUser: widget.currentUser, customerInput: mainCustomer, phone: mainPhone,
-          amount: unpaidDiff.abs(), cafeId: cafeId, selectedId: payers[0]['id'],
-          isAddingDebt: unpaidDiff > 0,
-          type: unpaidDiff > 0 ? "باقي فاتورة" : "رصيد زائد",
-          note: "تسوية نهائية لفاتورة ${widget.tableName} (إجمالي: ${total.round()})",
-        );
+      if (remainingInvoice > 0.01 && recordBalanceChange) {
+        String mainCustomer = payers[0]['nameController'].text.trim();
+        String mainPhone = payers[0]['phoneController'].text.trim();
+        if (mainCustomer != "زبون عام") {
+          await TransferService.syncWithDebts(
+            currentUser: widget.currentUser, customerInput: mainCustomer, phone: mainPhone,
+            amount: remainingInvoice, cafeId: cafeId, selectedId: payers[0]['id'],
+            isAddingDebt: true,
+            type: "باقي فاتورة",
+            note: "باقي فاتورة ${widget.tableName}: $itemsSummary",
+            items: allItems,
+          );
+        }
       }
 
       _clearUIAndPop();
-      ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text("✅ تمت العملية وجاري المزامنة..."), backgroundColor: Colors.green));
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text("✅ تمت العملية بنجاح وترحيل الأصناف لسجل الديون"), backgroundColor: Colors.green));
+      }
     } catch (e) {
       debugPrint("Error in multi-payer submission: $e");
       if (mounted) ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text("❌ خطأ: $e"), backgroundColor: Colors.red));
@@ -1434,9 +1738,10 @@ class _OrderPageState extends State<OrderPage> with TickerProviderStateMixin {
     _phoneController.clear();
     _receivedAmountController.clear();
     _barcodeInputController.clear();
+    searchNotifier.value = "";
     _selectedCustomerId = null;
     _selectedCustomerBalance = null;
     _selectedCustomerLimit = null;
-    if (Navigator.canPop(context)) Navigator.pop(context);
+    _onBackTap();
   }
 }

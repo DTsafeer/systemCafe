@@ -216,11 +216,13 @@ class _SmartAnalysisDialogState extends State<_SmartAnalysisDialog> {
                       columns: const [
                         DataColumn(label: Text('الصنف')),
                         DataColumn(label: Text('الكمية')),
+                        DataColumn(label: Text('العدد')),
                         DataColumn(label: Text('المجموع')),
                       ],
                       rows: sortedItems.map((entry) => DataRow(cells: [
                         DataCell(Text(entry.key)),
                         DataCell(Text(entry.value['qty'].toString())),
+                        DataCell(Text(entry.value['count'].toString())),
                         DataCell(Text("${entry.value['total'].toStringAsFixed(1)} ${widget.currencySymbol}")),
                       ])).toList(),
                     ),
